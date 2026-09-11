@@ -1,21 +1,21 @@
 Warmup
 - 20m 5:43/km Pace
 
-- 10m
+- Gammes 10m
 
 2x
-- 20s Z5 Pace
-- 40s Z1 Pace
-- 20s Z5 Pace
-- 40s Z1 Pace
-- 20s Z5 Pace
-- 40s Z1 Pace
-- 20s Z5 Pace
-- 40s Z1 Pace
-- 20s Z5 Pace
-- 40s Z1 Pace
-- 20s Z5 Pace
-- 3m Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 40s Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 40s Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 40s Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 40s Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 40s Z1 Pace
+- Effort 20s Z5 Pace
+- Récupération 3m Z1 Pace
 
 Cooldown
 - 10m 6:14/km Pace

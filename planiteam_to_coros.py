@@ -59,19 +59,29 @@ _HEADER_JOIN_FIXUPS = {
 
 @dataclass
 class Step:
-    """One timed instruction inside a workout segment."""
+    """One timed instruction inside a workout segment.
+
+    ``cue`` is free text placed *before* the duration on the rendered line
+    (e.g. "Effort 20s Z5 Pace"). Confirmed live that intervals.icu keeps this
+    as a step-level text label (not a structured type, unlike
+    ``Segment.role``'s warmup/cooldown flags - see CLAUDE.md), and that it
+    shows up as that step's block name on the COROS device.
+    """
 
     duration_s: int
     target: Optional[str] = None
+    cue: Optional[str] = None
 
     def render(self) -> str:
         token = _format_duration(self.duration_s)
-        if not self.target:
-            return token
         # intervals.icu's structured-workout syntax requires an explicit
         # "Pace" suffix for running targets (zone or absolute pace) - a bare
         # "Z5" defaults to a *power* zone, and a bare pace value is ignored.
-        return f"{token} {self.target} Pace"
+        parts = [self.cue] if self.cue else []
+        parts.append(token)
+        if self.target:
+            parts.append(f"{self.target} Pace")
+        return " ".join(parts)
 
 
 @dataclass
@@ -115,7 +125,7 @@ class Workout:
                     "repeat": segment.repeat,
                     "role": segment.role,
                     "steps": [
-                        {"duration_s": step.duration_s, "target": step.target}
+                        {"duration_s": step.duration_s, "target": step.target, "cue": step.cue}
                         for step in segment.steps
                     ],
                 }
@@ -208,6 +218,12 @@ def _cluster_rows(words: Sequence[dict], tol: float = 1.5) -> List[List[dict]]:
         row["words"].sort(key=lambda w: w["x0"])
     rows.sort(key=lambda r: r["top"])
     return [row["words"] for row in rows]
+
+
+def _display_name(name: str) -> str:
+    """Turn a PDF section name like "GAMMES" into a presentable cue ("Gammes")."""
+
+    return " ".join(word.capitalize() for word in name.split())
 
 
 def _parse_title(words: Sequence[dict]) -> str:
@@ -349,6 +365,19 @@ def _lookup_pace(table: Dict[float, Tuple[int, int]], vma: float, column: int) -
     return round(lower_v + (upper_v - lower_v) * ratio)
 
 
+def _zone_number(zone: str) -> int:
+    match = re.search(r"\d+", zone)
+    return int(match.group()) if match else 0
+
+
+def _zone_cue(zone: str, max_zone: int) -> str:
+    # Generic effort/recovery cue, not tied to this workout's specific hill-
+    # sprint content - the highest zone number used in the block is "Effort",
+    # anything lower is "Récupération". Confirmed live that this text becomes
+    # the step's block name on the COROS device (see Step.cue docstring).
+    return "Effort" if _zone_number(zone) >= max_zone else "Récupération"
+
+
 def _apply_zone_targets(entries: List[Tuple[int, Optional[int]]], zones: List[str]) -> List[Step]:
     """Turn (duration, rest) entries into Steps, tagging each with its zone.
 
@@ -361,14 +390,15 @@ def _apply_zone_targets(entries: List[Tuple[int, Optional[int]]], zones: List[st
     zone_by_duration: Dict[int, str] = {}
     for (duration_s, _rest_s), zone in zip(entries, zones):
         zone_by_duration.setdefault(duration_s, zone)
+    max_zone = max((_zone_number(z) for z in zones), default=0)
 
     steps: List[Step] = []
     for (duration_s, rest_s), zone in zip(entries, zones):
-        steps.append(Step(duration_s=duration_s, target=zone))
+        steps.append(Step(duration_s=duration_s, target=zone, cue=_zone_cue(zone, max_zone)))
         if rest_s:
             other = [d for d in zone_by_duration if d != duration_s]
             rest_zone = zone_by_duration[other[0]] if other else zone
-            steps.append(Step(duration_s=rest_s, target=rest_zone))
+            steps.append(Step(duration_s=rest_s, target=rest_zone, cue=_zone_cue(rest_zone, max_zone)))
     return steps
 
 
@@ -395,6 +425,14 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
         if is_main_set:
             steps = _apply_zone_targets(block["entries"], zones)
         else:
+            # Warm-up/cool-down already get a correctly-localised block name
+            # on the device from the warmup/cooldown flag alone (confirmed
+            # live - see CLAUDE.md), so no extra cue is added there. Any
+            # other single-step block (e.g. Planiteam's "GAMMES" drills) has
+            # no such flag available, so its own section name becomes the
+            # cue - generic to whatever a future PDF calls that block, not
+            # specific to this one.
+            cue = None if role else _display_name(name)
             steps = []
             for duration_s, rest_s in block["entries"]:
                 if role == "warmup" and warmup_pace is not None:
@@ -403,9 +441,9 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
                     target = _format_pace(cooldown_pace)
                 else:
                     target = None
-                steps.append(Step(duration_s=duration_s, target=target))
+                steps.append(Step(duration_s=duration_s, target=target, cue=cue))
                 if rest_s:
-                    steps.append(Step(duration_s=rest_s, target=None))
+                    steps.append(Step(duration_s=rest_s, target=None, cue=cue))
         segments.append(Segment(name=name, repeat=block["repeat"], steps=steps, role=role))
 
     return Workout(title=title, date=None, segments=segments, source_text=raw_text)

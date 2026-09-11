@@ -55,6 +55,24 @@ class PlaniteamToCorosTest(unittest.TestCase):
         self.assertTrue(text.startswith("Warmup\n"))
         self.assertIn("\n\nCooldown\n", text)
 
+    def test_blocks_get_generic_cue_text_for_device_display(self):
+        # Confirmed live: a leading cue word on a step's line becomes that
+        # step's block name on the COROS device (see CLAUDE.md). Warm-up and
+        # cool-down are deliberately left without one since the warmup/
+        # cooldown flag alone already gives them a correctly-localised name.
+        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        warmup, gammes, main_set, cooldown = workout.segments
+
+        self.assertIsNone(warmup.steps[0].cue)
+        self.assertIsNone(cooldown.steps[0].cue)
+        self.assertEqual(gammes.steps[0].cue, "Gammes")
+
+        cues = [step.cue for step in main_set.steps]
+        self.assertEqual(
+            cues,
+            ["Effort", "Récupération"] * 5 + ["Effort", "Récupération"],
+        )
+
     def test_main_set_is_two_reps_of_six_efforts_with_final_long_recovery(self):
         workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
         main_set = workout.segments[2]

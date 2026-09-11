@@ -264,9 +264,81 @@ keyword line. If a new PDF template uses different section names, the
 matching there (`"CHAUFFEMENT" in name.upper()` / `"CALME" in name.upper()`)
 is the place to extend.
 
-Not yet verified: whether this flag actually changes anything on the COROS
-watch itself (only `workout_doc`'s shape on intervals.icu's side was
-confirmed) — that requires the user to check a real sync. Also unconfirmed:
-whether a `Recovery`/`Rest`-style keyword exists for tagging the easy steps
-*inside* a repeat block the same way (not tested; the main set's `Z1`
-recovery steps currently carry no such flag, only a pace-zone target).
+Confirmed on a real watch: after pushing a corrected event, the user saw it
+auto-sync into the COROS app's Training Calendar with the warm-up/cool-down
+correctly typed. So this mechanism is verified end-to-end, not just on
+intervals.icu's side.
+
+### There is no equivalent keyword for "Recovery" steps inside a repeat
+
+Tried to get the main set's `Z1` jog steps tagged the same way (COROS calls
+this step type "Récupération"). **Exhaustively tested and it doesn't exist**
+— four live probes, all confirmed via `GET`+`workout_doc` inspection, then
+cleaned up (events deleted):
+
+1. `Recovery`/`Interval` as a **leading word on the same line** as a step
+   (`- Recovery 40s Z1 Pace`): parsed, but only becomes a free-text `"text"`
+   cue on that step (e.g. `{"text": "Recovery", "pace": {...}, "duration": 40}`)
+   — a label, not a structured type flag. No `"recovery": true` equivalent
+   appears anywhere.
+2. `Recovery` as its **own header line between the two child steps inside a
+   repeat** (mirroring how `Warmup`/`Cooldown` work): silently dropped
+   entirely — doesn't even survive as a text cue, the step comes back with
+   no trace of it.
+3. `Recovery` as a **standalone top-level segment header** (same shape as
+   the working `Warmup`/`Cooldown` test, just not nested in a repeat):
+   also dropped entirely, same as `Rest`.
+4. `Rest` as a standalone top-level header: same result as `Recovery` — dropped.
+
+Conclusion: **`Warmup` and `Cooldown` are the only two special step-type
+keywords intervals.icu's text format recognises.** There's no text-syntax
+equivalent for `Recovery`/`Rest`/`Active`/`Interval` — those FIT-style step
+types (if COROS's own display logic distinguishes them at all) are most
+likely inferred device-side from the step's pace/power **zone number**
+itself (e.g. zone 1 conventionally means "easy/recovery" across most
+platforms' zone models), not from anything intervals.icu's API exposes as a
+settable field. This repo doesn't control that — the main set's `Z1 Pace`
+target is already the most it can do; if COROS shows "Récupération" for
+those steps, it's reading that from the low zone number, not from a flag
+this code could set differently.
+
+The one real (if partial) lever available: option 1 above (`Recovery` as
+leading same-line text) genuinely works as a text cue. **This is now wired
+up** (see next section) — it doesn't change the step's *type*, but it does
+become the step's displayed block name on the device, which is what was
+actually being asked for.
+
+### Every block gets a device-visible name via `Step.cue`
+
+`Step.cue` is free text rendered before the duration on a step's line (e.g.
+`Effort 20s Z5 Pace`). Confirmed live (push, `GET`, inspect `workout_doc`)
+that it lands as that step's `"text"` field, and confirmed by the user on a
+real device that this is what shows as the block's name in the COROS app
+(their app showed unlabeled numbered blocks for every step without one -
+`Warmup`/`Cooldown` were already named correctly via the role flag, but the
+drills block and every individual interval/recovery step were just numbers).
+
+Rules implemented in `parse_planiteam_pdf`/`_apply_zone_targets` (kept
+deliberately generic - not specific to hill-sprint workouts, since any
+Planiteam PDF this parses could be a different session shape):
+
+- Warm-up/cool-down: **no cue** - the `warmup`/`cooldown` flag alone already
+  produces a correctly-localised device label (confirmed: shows as
+  "Echauffement"/"Retour au calme" in French even though the flag is set via
+  the literal English keyword - COROS localises the *flag*, not any text we
+  send). Adding a redundant cue here was deliberately not attempted; it's
+  unverified whether a cue would coexist with the flag's label or clobber it,
+  and there was no reason to risk the thing that already works correctly.
+- Any other single-step block (e.g. Planiteam's "GAMMES" drills, `role is
+  None` and not the main interval set): cue = that segment's own section
+  name, title-cased (`_display_name`) - e.g. `GAMMES` → `Gammes`. This reuses
+  whatever the PDF itself calls the block rather than hardcoding a label, so
+  it stays meaningful for a differently-shaped workout.
+- Main-set steps (the `Z5`/`Z1`-style alternating block): cue = `"Effort"` for
+  whichever zone number is highest in that block, `"Récupération"` for any
+  lower zone (`_zone_cue`/`_zone_number`). This is a **binary** effort-vs-
+  recovery heuristic - fine for the simple two-zone alternating pattern seen
+  so far, but would mislabel a block with more than two distinct zones (e.g.
+  a three-step pyramid) since everything below the single highest zone would
+  be called "Récupération" even if it's still a moderately hard effort. No
+  such PDF has been seen yet to design against; revisit if one shows up.
