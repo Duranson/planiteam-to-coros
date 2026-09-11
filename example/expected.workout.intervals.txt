@@ -1,3 +1,4 @@
+Warmup
 - 20m 5:43/km Pace
 
 - 10m
@@ -16,4 +17,5 @@
 - 20s Z5 Pace
 - 3m Z1 Pace
 
+Cooldown
 - 10m 6:14/km Pace

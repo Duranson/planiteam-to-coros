@@ -76,11 +76,22 @@ class Step:
 
 @dataclass
 class Segment:
-    """A named block of the workout (warm-up, main set, cool-down, ...)."""
+    """A named block of the workout (warm-up, main set, cool-down, ...).
+
+    ``role`` is ``"warmup"``, ``"cooldown"`` or ``None``. It drives the
+    intervals.icu "Warmup"/"Cooldown" section-header keywords in
+    ``to_intervals_icu_text()`` - confirmed live (see CLAUDE.md) to be the
+    only thing that makes intervals.icu tag a step's ``workout_doc`` entry
+    with ``"warmup": true`` / ``"cooldown": true``, which is what lets that
+    step sync to the watch as the correct step type instead of a generic
+    interval. The keyword must be the literal English word; Planiteam's
+    French section names ("ÉCHAUFFEMENT", "RETOUR AU CALME") do not work.
+    """
 
     name: str
     repeat: int = 1
     steps: List[Step] = field(default_factory=list)
+    role: Optional[str] = None
 
 
 @dataclass
@@ -102,6 +113,7 @@ class Workout:
                 {
                     "name": segment.name,
                     "repeat": segment.repeat,
+                    "role": segment.role,
                     "steps": [
                         {"duration_s": step.duration_s, "target": step.target}
                         for step in segment.steps
@@ -119,15 +131,24 @@ class Workout:
         extra indentation on its child steps), and intervals.icu's own style
         guide asks for a blank line before and after each repeat block -
         joining every segment with a blank line satisfies that generally.
+
+        A segment whose ``role`` is "warmup"/"cooldown" gets that literal
+        English keyword as its own header line (verified live: this, and
+        only this, is what makes intervals.icu tag the step as warmup/
+        cooldown for device sync - see the ``Segment.role`` docstring).
         """
+
+        role_keywords = {"warmup": "Warmup", "cooldown": "Cooldown"}
 
         blocks: List[str] = []
         for segment in self.segments:
             step_lines = "\n".join(f"- {step.render()}" for step in segment.steps)
             if segment.repeat > 1:
-                blocks.append(f"{segment.repeat}x\n{step_lines}")
+                body = f"{segment.repeat}x\n{step_lines}"
             else:
-                blocks.append(step_lines)
+                body = step_lines
+            keyword = role_keywords.get(segment.role or "")
+            blocks.append(f"{keyword}\n{body}" if keyword else body)
         return "\n\n".join(blocks)
 
 
@@ -369,21 +390,23 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     segments: List[Segment] = []
     for name, block in zip(section_names, blocks):
         is_main_set = len(zones) > 1 and len(block["entries"]) == len(zones)
+        role = "warmup" if "CHAUFFEMENT" in name.upper() else "cooldown" if "CALME" in name.upper() else None
+
         if is_main_set:
             steps = _apply_zone_targets(block["entries"], zones)
         else:
             steps = []
             for duration_s, rest_s in block["entries"]:
-                if "CHAUFFEMENT" in name.upper() and warmup_pace is not None:
+                if role == "warmup" and warmup_pace is not None:
                     target = _format_pace(warmup_pace)
-                elif "CALME" in name.upper() and cooldown_pace is not None:
+                elif role == "cooldown" and cooldown_pace is not None:
                     target = _format_pace(cooldown_pace)
                 else:
                     target = None
                 steps.append(Step(duration_s=duration_s, target=target))
                 if rest_s:
                     steps.append(Step(duration_s=rest_s, target=None))
-        segments.append(Segment(name=name, repeat=block["repeat"], steps=steps))
+        segments.append(Segment(name=name, repeat=block["repeat"], steps=steps, role=role))
 
     return Workout(title=title, date=None, segments=segments, source_text=raw_text)
 

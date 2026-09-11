@@ -243,3 +243,30 @@ it would need the *server-returned* `id`/`uid` cached locally after a
 successful push (e.g. a sidecar file keyed by PDF+date) and reused as a `PUT`
 target on the next run — this was consciously not built since nobody asked
 for it yet and it adds real state-management complexity.
+
+### Getting a step recognised as Warmup/Cooldown on the device
+
+intervals.icu's structured-workout text supports a bare `Warmup` or
+`Cooldown` line as a section header immediately before a block. This is not
+just a readability label — **confirmed live** (push a probe event, `GET` it
+back, inspect `workout_doc.steps`) that it is the only thing that makes
+intervals.icu tag that step `"warmup": true` / `"cooldown": true` in
+`workout_doc`, which is what should let it sync to the watch as the correct
+step type instead of a generic interval/active step. A step with no such
+header, or headed by anything else (including the *French* label Planiteam
+itself uses, `ÉCHAUFFEMENT` — tested, does **not** work), gets no such flag.
+It must be the literal English keyword.
+
+This is implemented as `Segment.role` (`"warmup"` / `"cooldown"` / `None`),
+set once in `parse_planiteam_pdf` from the same name-matching already used
+for pace lookup, then consumed by `to_intervals_icu_text()` to prepend the
+keyword line. If a new PDF template uses different section names, the
+matching there (`"CHAUFFEMENT" in name.upper()` / `"CALME" in name.upper()`)
+is the place to extend.
+
+Not yet verified: whether this flag actually changes anything on the COROS
+watch itself (only `workout_doc`'s shape on intervals.icu's side was
+confirmed) — that requires the user to check a real sync. Also unconfirmed:
+whether a `Recovery`/`Rest`-style keyword exists for tagging the easy steps
+*inside* a repeat block the same way (not tested; the main set's `Z1`
+recovery steps currently carry no such flag, only a pace-zone target).

@@ -38,6 +38,23 @@ class PlaniteamToCorosTest(unittest.TestCase):
         self.assertEqual(gammes.steps[0].duration_s, 10 * 60)
         self.assertIsNone(gammes.steps[0].target)
 
+    def test_warmup_and_cooldown_roles_are_tagged_for_device_step_type(self):
+        # Confirmed live against intervals.icu: a bare "Warmup"/"Cooldown"
+        # header line is what makes it tag the step for device sync (see
+        # CLAUDE.md) - Segment.role drives that header, so it must be set
+        # correctly on exactly these two segments.
+        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        warmup, gammes, main_set, cooldown = workout.segments
+
+        self.assertEqual(warmup.role, "warmup")
+        self.assertEqual(cooldown.role, "cooldown")
+        self.assertIsNone(gammes.role)
+        self.assertIsNone(main_set.role)
+
+        text = workout.to_intervals_icu_text()
+        self.assertTrue(text.startswith("Warmup\n"))
+        self.assertIn("\n\nCooldown\n", text)
+
     def test_main_set_is_two_reps_of_six_efforts_with_final_long_recovery(self):
         workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
         main_set = workout.segments[2]
