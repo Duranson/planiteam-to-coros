@@ -342,3 +342,90 @@ Planiteam PDF this parses could be a different session shape):
   a three-step pyramid) since everything below the single highest zone would
   be called "Récupération" even if it's still a moderately hard effort. No
   such PDF has been seen yet to design against; revisit if one shows up.
+  (Note: the zone *letters* `Z5`/`Z1` are still parsed and still drive this
+  cue internally - they're just never sent to intervals.icu as a target any
+  more, see next section.)
+
+### Main-set targets are computed from %VMA directly, not sent as intervals.icu zones
+
+Originally the main set's targets were `Z5 Pace`/`Z1 Pace` (an intervals.icu
+zone reference). Asked whether that could stay a *reference* all the way to
+the watch, so the watch's own threshold-pace estimate decides the actual
+pace - avoiding keeping intervals.icu's `threshold_pace` manually in sync
+with whatever COROS estimates on its own. Checked at the actual byte level
+rather than guessed: **it can't, so this was changed instead.**
+
+FIT's `workout_step` message *does* have a mechanism for a device-resolved
+target: a `target_speed_zone` field that (per the Garmin FIT SDK convention,
+same idea as `target_hr_zone` for heart rate) can hold a small zone-index
+integer and leave the device to resolve it against its own configured zones,
+instead of a pre-computed range. intervals.icu just never uses it. Downloaded
+the actual `.fit` export intervals.icu hands to a device
+(`GET /api/v1/athlete/{id}/events/{eventId}/download.fit`, parsed with the
+`fitdecode` package — a one-off diagnostic, not added to `requirements.txt`)
+for the `Z5`/`Z1`-targeted version of this workout and inspected every
+`workout_step`:
+
+```
+target_type: 'speed', target_speed_zone: 0,
+custom_target_speed_low: 3.802, custom_target_speed_high: 3.932   # Effort (Z5)
+target_type: 'speed', target_speed_zone: 0,
+custom_target_speed_low: 2.357, custom_target_speed_high: 2.947   # Récupération (Z1)
+```
+
+`target_speed_zone` was `0` (unused) on **every single step**, including the
+ones written as bare `Z5 Pace`/`Z1 Pace`. intervals.icu always resolves a
+pace zone into an absolute `custom_target_speed_low/high` range (m/s)
+server-side, using the athlete's *own intervals.icu* pace-zone configuration,
+before it ever reaches the FIT file. This also explained the earlier
+`null-null` symptom cleanly: there was nothing downstream to fall back to
+when `threshold_pace` was unset — resolution happens once, here, or not at
+all. So the double source of truth (COROS's own pace estimate vs.
+intervals.icu's `threshold_pace`) would be unavoidable for as long as pace
+*zones* are what gets sent for the main set - no config flag or alternate
+text syntax defers that resolution to the device.
+
+**Fix implemented**: `_vma_pace_target` (called from `_apply_zone_targets`,
+using the %VMA bands parsed by `_parse_main_set_zone_percents` - the
+"95-100%"/"0-65%" text overlaid next to the `Z5`/`Z1` labels, see the zone-
+label-overlay section above) computes an absolute pace directly from the
+PDF's own %VMA figures and `--vma`, the same way `_lookup_pace` already did
+for warm-up/cool-down. E.g. for VMA 17.5: `95-100%` → `3:26-3:37/km`,
+`0-65%` → `5:16/km` (a single value, not a range - see below). Verified this
+target syntax works the same way as the earlier syntax fixes: pushed a probe
+with `20s 3:26-3:37/km Pace`, `GET` it back, confirmed
+`workout_doc` shows `{"pace": {"units": "secs/km", "start": 206, "end": 217}}`
+- a real absolute range, no `pace_zone` unit anywhere. Then re-pushed the
+real event and confirmed the same on it (`moving_time` still 3400, correct
+`secs/km` values on every step).
+
+This does **not** eliminate a second number to maintain - the athlete's VMA
+in `--vma` still needs updating by hand occasionally - but it does eliminate
+intervals.icu's zone config specifically as a dependency: the main set no
+longer cares whether `threshold_pace` is set at all, same as warm-up/
+cool-down already didn't.
+
+**0% lower bound**: a %VMA band's lower bound of 0 (the actual PDF value for
+the recovery zone, `0-65%`) has no finite pace - 0% VMA is a dead stop, and
+means "go as slow as you like." The first attempt collapsed that case to a
+single pace value (just the band's faster/upper-% edge, e.g. `5:16/km` for
+`0-65%`) instead of an undefined open range. **That backfired in practice**:
+confirmed on the real watch that COROS renders a bare single-value pace
+target with its own tight auto-generated tolerance band - the user saw
+`5:16/km` show up on-device as `5'08/km - 5'24/km` (~2.5% either side),
+which reads as "hit close to this pace," the opposite of the intended "no
+real floor" meaning, and actively counter-productive for what's supposed to
+be a recovery interval.
+
+Fixed by flooring an open (`lo_pct <= 0`) lower bound at a fixed
+`_OPEN_LOWER_BOUND_FLOOR_PCT = 40` (%VMA) instead of leaving it as a single
+value, producing an explicit, honestly-wide range (`5:16-8:34/km` for
+VMA 17.5's `0-65%`) that a device renders as given, no auto-banding. This
+constant is a deliberate product choice ("a very easy jog"), not extracted
+from any PDF or derived from anything - the user explicitly preferred a
+fixed %VMA floor over the alternative that was considered (reusing the
+warm-up segment's own pace as the floor, which was rejected for silently
+assuming every workout has a warm-up to borrow from). Verified server-side
+after re-pushing: `workout_doc` shows `{"pace": {"start": 316, "end": 514,
+"units": "secs/km"}}` (5:16 → 8:34) on the recovery steps, `moving_time`
+still 3400.

@@ -79,17 +79,32 @@ class PlaniteamToCorosTest(unittest.TestCase):
 
         self.assertEqual(main_set.repeat, 2)
         durations_and_targets = [(step.duration_s, step.target) for step in main_set.steps]
+        effort, recovery = "3:26-3:37/km", "5:16-8:34/km"
         self.assertEqual(
             durations_and_targets,
             [
-                (20, "Z5"), (40, "Z1"),
-                (20, "Z5"), (40, "Z1"),
-                (20, "Z5"), (40, "Z1"),
-                (20, "Z5"), (40, "Z1"),
-                (20, "Z5"), (40, "Z1"),
-                (20, "Z5"), (180, "Z1"),
+                (20, effort), (40, recovery),
+                (20, effort), (40, recovery),
+                (20, effort), (40, recovery),
+                (20, effort), (40, recovery),
+                (20, effort), (40, recovery),
+                (20, effort), (180, recovery),
             ],
         )
+
+    def test_main_set_targets_are_vma_derived_paces_not_intervals_icu_zones(self):
+        # intervals.icu always pre-resolves a "Z5 Pace"-style zone target
+        # into an absolute pace using its own athlete-side zone config before
+        # a workout ever reaches a device (verified at the FIT byte level,
+        # see CLAUDE.md), so the main set targets a pace computed directly
+        # from the PDF's own %VMA bands and the given VMA instead - this
+        # should hold regardless of the athlete's intervals.icu zone setup.
+        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        main_set = workout.segments[2]
+
+        for step in main_set.steps:
+            self.assertNotIn("Z", step.target)
+            self.assertIn("/km", step.target)
 
     def test_total_duration_matches_planiteam_summary(self):
         # The Planiteam UI reports a total duration of 56:40 for this session.

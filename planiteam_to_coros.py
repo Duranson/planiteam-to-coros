@@ -48,6 +48,7 @@ _DURATION_RE = re.compile(r"^(\d{1,3}):(\d{2})$")
 _REPEAT_RE = re.compile(r"^(\d+)x$", re.IGNORECASE)
 _PACE_RE = re.compile(r"^(\d+)'(\d{2})/km$")
 _ZONE_RE = re.compile(r"^Z\d+$")
+_PERCENT_RANGE_RE = re.compile(r"^(\d+)-(\d+)%$")
 _VMA_LABEL_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 # Known line-wrap artefact in Planiteam's fixed PDF template: long section
@@ -186,9 +187,47 @@ def _parse_pace(value: str) -> int:
     return int(minutes) * 60 + int(seconds)
 
 
-def _format_pace(total_seconds: int) -> str:
-    minutes, seconds = divmod(total_seconds, 60)
-    return f"{minutes}:{seconds:02d}/km"
+def _format_pace_value(total_seconds: float) -> str:
+    minutes, seconds = divmod(round(total_seconds), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _format_pace(total_seconds: float) -> str:
+    return f"{_format_pace_value(total_seconds)}/km"
+
+
+# A %VMA band with a 0% lower bound (e.g. Planiteam's "0-65%" recovery zone)
+# means "go as slow as you like" - not a literal dead stop. A single-value
+# pace target doesn't convey that: confirmed live that COROS renders a bare
+# absolute pace target with its own tight auto-generated tolerance band
+# (a "5:16/km" target showed on the watch as "5'08/km - 5'24/km", ~2.5%
+# either side), which reads as "hit close to this" - the opposite of the
+# intended "no real floor" meaning, and actively counter-productive for a
+# recovery interval. So an open (0%) lower bound is floored at this fixed
+# %VMA instead, to get an explicit, wide, honestly-permissive range - not
+# extracted from any PDF, just a reasonable "very easy jog" floor.
+_OPEN_LOWER_BOUND_FLOOR_PCT = 40
+
+
+def _vma_pace_target(lo_pct: int, hi_pct: int, vma: float) -> str:
+    """Compute an absolute pace range target for a %VMA band.
+
+    intervals.icu always pre-resolves pace *zone* targets (like "Z5 Pace")
+    into an absolute pace using its own athlete-side zone config before a
+    workout ever reaches a device - verified at the FIT byte level, see
+    CLAUDE.md. Computing the pace here instead, directly from the %VMA the
+    PDF actually prints and the athlete's own ``--vma``, means the main set
+    no longer depends on intervals.icu's zone configuration at all - same as
+    warm-up/cool-down already don't.
+    """
+
+    speed_hi = vma * hi_pct / 100
+    fast_s = 3600 / speed_hi
+    if lo_pct <= 0:
+        lo_pct = _OPEN_LOWER_BOUND_FLOOR_PCT
+    speed_lo = vma * lo_pct / 100
+    slow_s = 3600 / speed_lo
+    return f"{_format_pace_value(fast_s)}-{_format_pace_value(slow_s)}/km"
 
 
 def _extract_page_words(path: Union[str, Path]) -> Tuple[List[dict], str]:
@@ -328,6 +367,13 @@ def _parse_main_set_zones(words: Sequence[dict]) -> List[str]:
     return [w["text"] for w in zone_words]
 
 
+def _parse_main_set_zone_percents(words: Sequence[dict]) -> List[Tuple[int, int]]:
+    """The "95-100%"/"0-65%" %VMA bands overlaid alongside the zone labels."""
+
+    percent_words = sorted((w for w in words if _PERCENT_RANGE_RE.match(w["text"])), key=lambda w: w["x0"])
+    return [tuple(int(v) for v in _PERCENT_RANGE_RE.match(w["text"]).groups()) for w in percent_words]
+
+
 def _parse_pace_table(words: Sequence[dict]) -> Dict[float, Tuple[int, int]]:
     """Parse the VMA reference table into ``{vma: (warmup_pace_s, cooldown_pace_s)}``."""
 
@@ -378,8 +424,22 @@ def _zone_cue(zone: str, max_zone: int) -> str:
     return "Effort" if _zone_number(zone) >= max_zone else "Récupération"
 
 
-def _apply_zone_targets(entries: List[Tuple[int, Optional[int]]], zones: List[str]) -> List[Step]:
-    """Turn (duration, rest) entries into Steps, tagging each with its zone.
+def _apply_zone_targets(
+    entries: List[Tuple[int, Optional[int]]],
+    zones: List[str],
+    percents: List[Tuple[int, int]],
+    vma: float,
+) -> List[Step]:
+    """Turn (duration, rest) entries into Steps, targeting each at a VMA-derived pace.
+
+    The target is computed directly from the %VMA band the PDF prints (e.g.
+    "95-100%") and ``vma`` (see ``_vma_pace_target``) rather than an
+    intervals.icu zone reference like "Z5 Pace" - intervals.icu always
+    resolves those itself using its own zone config before a workout reaches
+    a device (verified at the FIT byte level, see CLAUDE.md), so computing
+    the pace here instead removes that dependency entirely. The zone letters
+    are still used, but only internally, to pick the "Effort"/"Récupération"
+    cue text.
 
     A trailing rest value (e.g. the 3:00 recovery before the outer set
     repeats) is treated as an extra step in whichever zone is used by the
@@ -388,17 +448,22 @@ def _apply_zone_targets(entries: List[Tuple[int, Optional[int]]], zones: List[st
     """
 
     zone_by_duration: Dict[int, str] = {}
-    for (duration_s, _rest_s), zone in zip(entries, zones):
+    percent_by_duration: Dict[int, Tuple[int, int]] = {}
+    for (duration_s, _rest_s), zone, pct in zip(entries, zones, percents):
         zone_by_duration.setdefault(duration_s, zone)
+        percent_by_duration.setdefault(duration_s, pct)
     max_zone = max((_zone_number(z) for z in zones), default=0)
 
     steps: List[Step] = []
-    for (duration_s, rest_s), zone in zip(entries, zones):
-        steps.append(Step(duration_s=duration_s, target=zone, cue=_zone_cue(zone, max_zone)))
+    for (duration_s, rest_s), zone, pct in zip(entries, zones, percents):
+        target = _vma_pace_target(pct[0], pct[1], vma)
+        steps.append(Step(duration_s=duration_s, target=target, cue=_zone_cue(zone, max_zone)))
         if rest_s:
             other = [d for d in zone_by_duration if d != duration_s]
             rest_zone = zone_by_duration[other[0]] if other else zone
-            steps.append(Step(duration_s=rest_s, target=rest_zone, cue=_zone_cue(rest_zone, max_zone)))
+            rest_pct = percent_by_duration[other[0]] if other else pct
+            rest_target = _vma_pace_target(rest_pct[0], rest_pct[1], vma)
+            steps.append(Step(duration_s=rest_s, target=rest_target, cue=_zone_cue(rest_zone, max_zone)))
     return steps
 
 
@@ -412,6 +477,7 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     section_names = _parse_section_headers(words)
     blocks = _parse_main_row(words)
     zones = _parse_main_set_zones(words)
+    percents = _parse_main_set_zone_percents(words)
     pace_table = _parse_pace_table(words)
 
     warmup_pace = _lookup_pace(pace_table, vma, column=0)
@@ -419,11 +485,11 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
 
     segments: List[Segment] = []
     for name, block in zip(section_names, blocks):
-        is_main_set = len(zones) > 1 and len(block["entries"]) == len(zones)
+        is_main_set = len(zones) > 1 and len(block["entries"]) == len(zones) == len(percents)
         role = "warmup" if "CHAUFFEMENT" in name.upper() else "cooldown" if "CALME" in name.upper() else None
 
         if is_main_set:
-            steps = _apply_zone_targets(block["entries"], zones)
+            steps = _apply_zone_targets(block["entries"], zones, percents, vma)
         else:
             # Warm-up/cool-down already get a correctly-localised block name
             # on the device from the warmup/cooldown flag alone (confirmed
