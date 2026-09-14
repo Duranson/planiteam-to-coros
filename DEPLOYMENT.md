@@ -53,16 +53,35 @@ printf '%s' '17.5' | gcloud secrets create VMA --data-file=-
 # Shared secret that authenticates Apps Script's requests to this function.
 # Generate your own - never commit the actual value to git, even to a
 # private repo (visibility can change, and it stays in history forever).
-# Kept as a shell variable (not a file) so step 3's smoke test can reuse it -
-# it only lives in this Cloud Shell session, gone when the session ends.
-SHARED_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-printf '%s' "$SHARED_SECRET" | gcloud secrets create SHARED_SECRET --data-file=-
+# This only needs to exist in Secret Manager, not as a shell variable - later
+# steps re-fetch it with `gcloud secrets versions access` rather than relying
+# on a variable surviving between commands (Cloud Shell sessions don't).
+printf '%s' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" | gcloud secrets create SHARED_SECRET --data-file=-
 ```
 
 (If a secret already exists from a previous attempt, use
 `gcloud secrets versions add NAME --data-file=-` instead of `create`.)
 
-## 2. Deploy the Cloud Function
+## 2. Grant the function's service account access to those secrets
+
+On newer GCP projects the default compute service account no longer gets
+broad project access automatically, so it has to be given explicit
+permission to read each secret - otherwise the deploy in the next step
+fails with `Permission denied on secret: ... The service account used must
+be granted the 'Secret Manager Secret Accessor' role`.
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+for SECRET in INTERVALS_ICU_API_KEY INTERVALS_ICU_ATHLETE_ID VMA SHARED_SECRET; do
+  gcloud secrets add-iam-policy-binding "$SECRET" \
+    --member="serviceAccount:${SERVICE_ACCOUNT}" \
+    --role="roles/secretmanager.secretAccessor"
+done
+```
+
+## 3. Deploy the Cloud Function
 
 Run this from the repo root (`.gcloudignore` already excludes `.env`,
 `.venv/`, `tests/`, `example/`, etc. from the upload):
@@ -86,16 +105,25 @@ secret gets a 401, and the worst a leaked secret enables is someone pushing
 garbage workouts to your own intervals.icu account, not any data exposure.
 
 Capture the URL (also shown as `httpsTrigger.url` in the deploy output) -
-you'll need it again for Apps Script's `CLOUD_FUNCTION_URL` property in step 4:
+you'll need it again for Apps Script's `CLOUD_FUNCTION_URL` property in step 5:
 
 ```bash
 FUNCTION_URL=$(gcloud functions describe planiteam-to-coros --gen2 --region="$REGION" --format='value(serviceConfig.uri)')
 echo "$FUNCTION_URL"
 ```
 
-## 3. Smoke-test the deployed function
+## 4. Smoke-test the deployed function
+
+Reads both values straight from GCP rather than assuming a shell variable
+from an earlier step is still around - `FUNCTION_URL` and `SHARED_SECRET`
+only exist for the life of one Cloud Shell session, and step 1 sets
+`SHARED_SECRET` as a secret in Secret Manager, not as a shell variable, so
+it doesn't carry over between commands unless you set it yourself first:
 
 ```bash
+FUNCTION_URL=$(gcloud functions describe planiteam-to-coros --gen2 --region="$REGION" --format='value(serviceConfig.uri)')
+SHARED_SECRET=$(gcloud secrets versions access latest --secret=SHARED_SECRET)
+
 python3 -c "
 import base64, json
 print(json.dumps({'date': '2026-09-17', 'pdf_base64': base64.b64encode(open('example/cotes-courtes-2x6x20-.pdf','rb').read()).decode()}))
@@ -112,17 +140,16 @@ event from intervals.icu afterwards (calendar view, or
 `DELETE /api/v1/athlete/{id}/events/{eventId}` the same way earlier testing
 in this repo did).
 
-## 4. Set up Apps Script
+## 5. Set up Apps Script
 
 1. Go to https://script.google.com -> New project.
 2. Replace the default `Code.gs` content with this repo's
    `apps_script/Code.gs`.
 3. Project Settings (gear icon) -> Script Properties -> add:
-   - `CLOUD_FUNCTION_URL` = the URL from step 2
-   - `SHARED_SECRET` = the same value stored in Secret Manager above (if
-     your Cloud Shell session ended and you lost the `$SHARED_SECRET`
-     variable, retrieve it again with
-     `gcloud secrets versions access latest --secret=SHARED_SECRET`)
+   - `CLOUD_FUNCTION_URL` = the URL from step 3
+   - `SHARED_SECRET` = fetch the value with
+     `gcloud secrets versions access latest --secret=SHARED_SECRET` and
+     paste it in
 4. Run `checkForNewPlaniteamEmails` once manually from the editor (Run button)
    to trigger Gmail's OAuth consent screen - approve it (it's your own
    script asking for your own Gmail access, first-party, no external review
@@ -132,7 +159,7 @@ in this repo did).
    - Event source: Time-driven
    - Type: Minutes timer -> Every 30 minutes
 
-## 5. End-to-end test
+## 6. End-to-end test
 
 Find a real Planiteam notification email in Gmail (or wait for the next
 one), mark it unread, and either wait for the next 30-minute trigger or run
