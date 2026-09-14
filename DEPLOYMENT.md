@@ -44,7 +44,12 @@ Cloud Console/`gcloud functions describe` output in plain text) - use
 
 ```bash
 gcloud config set project "$PROJECT_ID"
-gcloud services enable secretmanager.googleapis.com cloudfunctions.googleapis.com cloudbuild.googleapis.com run.googleapis.com
+# cloudresourcemanager is easy to miss: an *interactive* `gcloud functions
+# deploy` silently offers to enable it for you on the fly ("enable this API?
+# (y/N)"), so a manual first deploy can work without it ever being enabled
+# explicitly - then a non-interactive one (CI) hits that same prompt with no
+# terminal to answer it, and just fails instead.
+gcloud services enable secretmanager.googleapis.com cloudfunctions.googleapis.com cloudbuild.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com
 
 printf '%s' 'PASTE_YOUR_INTERVALS_ICU_API_KEY' | gcloud secrets create INTERVALS_ICU_API_KEY --data-file=-
 printf '%s' 'PASTE_YOUR_INTERVALS_ICU_ATHLETE_ID' | gcloud secrets create INTERVALS_ICU_ATHLETE_ID --data-file=-
