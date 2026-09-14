@@ -171,6 +171,87 @@ one), mark it unread, and either wait for the next 30-minute trigger or run
   then syncs to COROS the same way every manual push in this repo already
   has.
 
+## 7. Keep the Cloud Function in sync with `main` (continuous deployment)
+
+Steps 1-4 deploy whatever was in the working directory at that moment -
+nothing about the running function watches the repo afterwards. Every code
+change from here on needs a fresh `gcloud functions deploy`, or it silently
+keeps running the old version. `.github/workflows/deploy.yml` automates
+that: on every push to `main` that touches `main.py`, `planiteam_to_coros.py`,
+`requirements.txt` or `.gcloudignore`, it runs the test suite and then the
+exact same deploy command from step 3.
+
+Authentication uses **Workload Identity Federation**: GitHub's own per-run
+OIDC token is exchanged for short-lived GCP access, scoped to this one repo
+- no long-lived key stored anywhere, nothing to leak or rotate. One-time
+setup, run in Cloud Shell:
+
+```bash
+GITHUB_REPO="Duranson/planiteam-to-coros"   # owner/repo, exactly as on GitHub
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+
+# A dedicated service account for the deploy step, not the default compute
+# one - keeps the CI credential's permissions to exactly what it needs.
+gcloud iam service-accounts create github-deployer \
+  --display-name="GitHub Actions deployer for planiteam-to-coros"
+DEPLOYER_SA="github-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# Everything a Cloud Functions Gen2 deploy actually touches under the hood:
+# Cloud Run (what Gen2 functions run on), Cloud Build (compiles the source
+# into a container image), Artifact Registry (stores that image), and
+# permission to hand the function its own runtime service account.
+for ROLE in roles/cloudfunctions.developer roles/run.developer \
+            roles/cloudbuild.builds.editor roles/artifactregistry.writer \
+            roles/iam.serviceAccountUser; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${DEPLOYER_SA}" \
+    --role="$ROLE" \
+    --condition=None
+done
+
+# A Workload Identity Pool + an OIDC provider that trusts GitHub Actions
+# tokens - but only ones asserting they came from this exact repo.
+gcloud iam workload-identity-pools create "github-pool" \
+  --location="global" \
+  --display-name="GitHub Actions pool"
+
+gcloud iam workload-identity-pools providers create-oidc "github-provider" \
+  --location="global" \
+  --workload-identity-pool="github-pool" \
+  --display-name="GitHub provider" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+  --attribute-condition="assertion.repository == '${GITHUB_REPO}'" \
+  --issuer-uri="https://token.actions.githubusercontent.com"
+
+# Let tokens from that provider/repo impersonate the deployer service
+# account - and only that repo; nothing else can mint a token this trusts.
+gcloud iam service-accounts add-iam-policy-binding "$DEPLOYER_SA" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GITHUB_REPO}"
+
+# The full provider resource name the GitHub Actions workflow needs.
+gcloud iam workload-identity-pools providers describe "github-provider" \
+  --location="global" \
+  --workload-identity-pool="github-pool" \
+  --format="value(name)"
+```
+
+Then, in the GitHub repo -> Settings -> Secrets and variables -> Actions ->
+**Variables** tab (none of these are secret - WIF is the whole point of not
+needing a stored credential), add:
+
+| Name | Value |
+|---|---|
+| `GCP_PROJECT_ID` | `$PROJECT_ID` |
+| `GCP_REGION` | `$REGION` (e.g. `europe-west1`) |
+| `GCP_DEPLOYER_SA` | `github-deployer@<project-id>.iam.gserviceaccount.com` |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | the full resource name printed by the last command above |
+
+Push to `main` and check the Actions tab - the workflow should run the
+tests, then redeploy. From here on, `gcloud functions deploy` by hand
+(steps 1-4) is only needed for the very first deploy or if Secret Manager
+values themselves change; ordinary code changes just need a push.
+
 ## Failure behaviour
 
 A message that fails to parse or push gets labelled `PlaniTeam-Sync-Error`

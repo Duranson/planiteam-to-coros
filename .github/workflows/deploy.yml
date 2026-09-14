@@ -1,0 +1,61 @@
+name: Deploy Cloud Function
+
+# Keeps the deployed Cloud Function (the Gmail -> intervals.icu automation's
+# processing side) in sync with main - see DEPLOYMENT.md. Without this,
+# `gcloud functions deploy` only ever reflects whatever was in the working
+# directory the last time someone ran it by hand.
+#
+# Scoped to only the files that actually affect the deployed function, so an
+# unrelated change (docs, the Apps Script side, example PDFs) doesn't trigger
+# a pointless redeploy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "planiteam_to_coros.py"
+      - "requirements.txt"
+      - ".gcloudignore"
+      - ".github/workflows/deploy.yml"
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation - no stored credential
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - id: auth
+        name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Cloud Function
+        run: |
+          gcloud functions deploy planiteam-to-coros \
+            --gen2 \
+            --runtime=python312 \
+            --region="${{ vars.GCP_REGION }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --source=. \
+            --entry-point=handle_planiteam_email \
+            --trigger-http \
+            --allow-unauthenticated \
+            --set-secrets="INTERVALS_ICU_API_KEY=INTERVALS_ICU_API_KEY:latest,INTERVALS_ICU_ATHLETE_ID=INTERVALS_ICU_ATHLETE_ID:latest,VMA=VMA:latest,SHARED_SECRET=SHARED_SECRET:latest"
