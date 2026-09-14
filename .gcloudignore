@@ -1,0 +1,15 @@
+# Files excluded from the Cloud Function deployment bundle.
+# Critically: .env holds real secrets and must never be uploaded - the
+# deployed function gets credentials via --set-secrets instead.
+.env
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+tests/
+example/
+CLAUDE.md
+DEPLOYMENT.md
+README.md
+apps_script/
