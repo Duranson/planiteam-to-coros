@@ -202,10 +202,13 @@ gcloud iam service-accounts create github-deployer \
 DEPLOYER_SA="github-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # Everything a Cloud Functions Gen2 deploy actually touches under the hood:
-# Cloud Run (what Gen2 functions run on), Cloud Build (compiles the source
+# Cloud Run (what Gen2 functions run on - roles/run.admin, not the narrower
+# roles/run.developer, because --allow-unauthenticated below needs
+# run.services.setIamPolicy to grant public invoke access, which
+# run.developer deliberately excludes), Cloud Build (compiles the source
 # into a container image), Artifact Registry (stores that image), and
 # permission to hand the function its own runtime service account.
-for ROLE in roles/cloudfunctions.developer roles/run.developer \
+for ROLE in roles/cloudfunctions.developer roles/run.admin \
             roles/cloudbuild.builds.editor roles/artifactregistry.writer \
             roles/iam.serviceAccountUser; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
