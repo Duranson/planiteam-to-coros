@@ -166,9 +166,12 @@ class Workout:
 def _format_duration(total_seconds: int) -> str:
     if total_seconds <= 0:
         return "0s"
-    if total_seconds % 60 == 0:
-        return f"{total_seconds // 60}m"
-    return f"{total_seconds}s"
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes == 0:
+        return f"{seconds}s"
+    if seconds == 0:
+        return f"{minutes}m"
+    return f"{minutes}m{seconds}s"
 
 
 def _parse_mmss(value: str) -> int:
@@ -339,10 +342,33 @@ def _parse_main_row(words: Sequence[dict]) -> List[dict]:
     """Return the ordered ``Nx ==> duration / rest`` blocks along the page.
 
     Each block is ``{"repeat": int, "entries": [(duration_s, rest_s | None), ...]}``.
+
+    The two rows involved (durations, then "r = rest" below them) are found
+    *relative to each other* - the "==>" row, then the nearest row above it
+    that actually has "Nx" repeat markers on it - rather than at fixed page
+    coordinates. An earlier version hardcoded absolute ``top`` bands
+    reverse-engineered from one sample PDF; a second real PDF broke it
+    immediately, because its section headers happened not to wrap onto a
+    second line, shifting everything below them up by ~9pt. Coordinates
+    drift between PDFs; the relationship between these two particular rows
+    doesn't - though it isn't always the *immediately* preceding row: the
+    pace table's own "VMA" column-header label sits in the gap between them
+    on some PDFs, as its own single-word row, so this walks upward past any
+    row without a repeat marker rather than assuming adjacency.
     """
 
-    duration_row = sorted((w for w in words if 128 <= w["top"] <= 136), key=lambda w: w["x0"])
-    rest_row = [w for w in words if 140 <= w["top"] <= 150]
+    rows = _cluster_rows(words)
+    rest_row_index = next((i for i, row in enumerate(rows) if any(w["text"] == "==>" for w in row)), None)
+    if rest_row_index is None:
+        return []
+    duration_row_index = next(
+        (i for i in range(rest_row_index - 1, -1, -1) if any(_REPEAT_RE.match(w["text"]) for w in rows[i])),
+        None,
+    )
+    if duration_row_index is None:
+        return []
+    rest_row = rows[rest_row_index]
+    duration_row = sorted(rows[duration_row_index], key=lambda w: w["x0"])
     rest_values = iter(_pair_rest_values(rest_row))
 
     blocks: List[dict] = []
@@ -374,23 +400,41 @@ def _parse_main_set_zone_percents(words: Sequence[dict]) -> List[Tuple[int, int]
     return [tuple(int(v) for v in _PERCENT_RANGE_RE.match(w["text"]).groups()) for w in percent_words]
 
 
-def _parse_pace_table(words: Sequence[dict]) -> Dict[float, Tuple[int, int]]:
-    """Parse the VMA reference table into ``{vma: (warmup_pace_s, cooldown_pace_s)}``."""
+def _parse_pace_table(words: Sequence[dict]) -> Dict[float, List[int]]:
+    """Parse the VMA reference table into ``{vma: [pace_s, pace_s, ...]}``.
 
-    rows = _cluster_rows([w for w in words if w["top"] > 150], tol=1.5)
+    Column count varies by PDF: some workouts only print 2 columns (a
+    warm-up and a cool-down pace); others (no %VMA zone overlay - see
+    ``parse_planiteam_pdf``) print one column per session phase instead.
+    Both are handled the same way here; it's up to the caller to decide
+    which columns mean what.
 
-    table: Dict[float, Tuple[int, int]] = {}
-    for row in rows:
-        if not row or not _VMA_LABEL_RE.match(row[0]["text"]):
-            continue
-        paces = sorted((w for w in row if _PACE_RE.match(w["text"])), key=lambda w: w["x0"])
+    Rows are anchored on their VMA-value label (the leftmost column, e.g.
+    "17.5") rather than a fixed row-clustering tolerance: the label's exact
+    vertical offset from its own pace values varies by a couple of points
+    between PDFs (different fonts/rendering for a longer table), enough to
+    fall outside a tight tolerance and silently drop the row.
+    """
+
+    below_grid = [w for w in words if w["top"] > 150]
+    labels = sorted(
+        (w for w in below_grid if w["x0"] < 90 and _VMA_LABEL_RE.match(w["text"])),
+        key=lambda w: w["top"],
+    )
+
+    table: Dict[float, List[int]] = {}
+    for label in labels:
+        paces = sorted(
+            (w for w in below_grid if abs(w["top"] - label["top"]) <= 6 and _PACE_RE.match(w["text"])),
+            key=lambda w: w["x0"],
+        )
         if len(paces) < 2:
             continue
-        table[float(row[0]["text"])] = (_parse_pace(paces[0]["text"]), _parse_pace(paces[-1]["text"]))
+        table[float(label["text"])] = [_parse_pace(w["text"]) for w in paces]
     return table
 
 
-def _lookup_pace(table: Dict[float, Tuple[int, int]], vma: float, column: int) -> Optional[int]:
+def _lookup_pace(table: Dict[float, List[int]], vma: float, column: int) -> Optional[int]:
     """Look up (or linearly interpolate) the pace for a given VMA and column."""
 
     if not table:
@@ -469,7 +513,22 @@ def _apply_zone_targets(
 
 def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Workout:
     """Parse a Planiteam PDF export into a Workout, using ``vma`` (km/h) to
-    resolve the warm-up/cool-down paces from the PDF's reference table."""
+    resolve step paces from the PDF's reference table.
+
+    Two different pace-table layouts have been seen from Planiteam, and this
+    dispatches between them (see CLAUDE.md for how each was found):
+
+    - Zone-overlay PDFs: a 2-column table (warm-up pace, cool-down pace) plus
+      a separate "Z5"/"95-100%"-style overlay for the main set, converted to
+      an absolute pace via ``_vma_pace_target``.
+    - Per-step PDFs: no zone overlay at all - instead one pace-table column
+      per session phase (warm-up, each main-set entry, cool-down), looked up
+      directly.
+
+    Raises ``ValueError`` if nothing was parsed, rather than silently
+    returning an empty workout - a differently-shaped PDF should fail loudly
+    here, not push an empty session to a device with no error anywhere.
+    """
 
     words, raw_text = _extract_page_words(path)
 
@@ -481,15 +540,46 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     pace_table = _parse_pace_table(words)
 
     warmup_pace = _lookup_pace(pace_table, vma, column=0)
-    cooldown_pace = _lookup_pace(pace_table, vma, column=1)
+    cooldown_pace = _lookup_pace(pace_table, vma, column=-1)
+
+    pace_table_columns = len(next(iter(pace_table.values()), []))
+    total_flat_entries = sum(len(block["entries"]) for block in blocks)
+    use_per_step_pace = not zones and pace_table_columns > 2 and pace_table_columns == total_flat_entries
 
     segments: List[Segment] = []
+    flat_index = 0
     for name, block in zip(section_names, blocks):
-        is_main_set = len(zones) > 1 and len(block["entries"]) == len(zones) == len(percents)
-        role = "warmup" if "CHAUFFEMENT" in name.upper() else "cooldown" if "CALME" in name.upper() else None
+        is_zone_main_set = len(zones) > 1 and len(block["entries"]) == len(zones) == len(percents)
+        # Whitespace-insensitive: "ÉCHAUFFEMENT" wraps onto two text rows at
+        # a different character each time depending on the PDF (seen both
+        # "ÉCHAUFFEM"/"ENT" and "ÉCHAUFFEME"/"NT" splits), and
+        # _HEADER_JOIN_FIXUPS only knows the exact splits seen so far. This
+        # only matters for role detection, not display - warmup/cooldown
+        # segments never use their own name as a cue (see below), so an
+        # imperfect join here is harmless as long as the role is still found.
+        name_compact = name.upper().replace(" ", "")
+        role = "warmup" if "CHAUFFEMENT" in name_compact else "cooldown" if "CALME" in name_compact else None
 
-        if is_main_set:
+        if is_zone_main_set:
             steps = _apply_zone_targets(block["entries"], zones, percents, vma)
+        elif use_per_step_pace:
+            # No zone/percent overlay exists to classify entries, so a block
+            # with more than one entry (and no warmup/cooldown role) is
+            # assumed to be the alternating effort/recovery main set -
+            # starting with an effort, same as every workout seen so far.
+            is_alternating = role is None and len(block["entries"]) > 1
+            steps = []
+            for i, (duration_s, rest_s) in enumerate(block["entries"]):
+                target = _format_pace(_lookup_pace(pace_table, vma, column=flat_index))
+                flat_index += 1
+                cue = ("Effort" if i % 2 == 0 else "Récupération") if is_alternating else (None if role else _display_name(name))
+                steps.append(Step(duration_s=duration_s, target=target, cue=cue))
+                if rest_s:
+                    # Not observed in any per-step PDF so far (their rest
+                    # values are always blank) - no pace-table column to
+                    # attribute this to, so it's left untargeted rather than
+                    # guessing.
+                    steps.append(Step(duration_s=rest_s, target=None, cue=cue))
         else:
             # Warm-up/cool-down already get a correctly-localised block name
             # on the device from the warmup/cooldown flag alone (confirmed
@@ -511,6 +601,12 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
                 if rest_s:
                     steps.append(Step(duration_s=rest_s, target=None, cue=cue))
         segments.append(Segment(name=name, repeat=block["repeat"], steps=steps, role=role))
+
+    if not segments:
+        raise ValueError(
+            f"Parsed zero segments from {path} - its layout doesn't match what this parser expects "
+            "(see CLAUDE.md for the structural assumptions this relies on)."
+        )
 
     return Workout(title=title, date=None, segments=segments, source_text=raw_text)
 

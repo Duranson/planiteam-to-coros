@@ -1,15 +1,26 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from planiteam_to_coros import Workout, parse_planiteam_pdf
 
-SAMPLE_PDF = Path("example/cotes-courtes-2x6x20-.pdf")
 SAMPLE_VMA = 17.5
+
+# Three real Planiteam PDFs, each in its own folder named after the session
+# date (from the notification email, not the PDF - it has no date field).
+# They cover the two structurally different pace-table layouts this parser
+# has to dispatch between - see CLAUDE.md.
+HILL_SPRINTS_PDF = Path("example/2026-09-10/cotes-courtes-2x6x20-.pdf")
+HILL_SPRINTS_EXPECTED = Path("example/2026-09-10/expected.workout.intervals.txt")
+STAIRS_PDF = Path("example/2026-09-15/travail-escaliers-12-a-15x45-45-sur-boucle-vallonnee.pdf")
+STAIRS_EXPECTED = Path("example/2026-09-15/expected.workout.intervals.txt")
+PYRAMID_PDF = Path("example/2026-09-17/seuil-pyramide-2-4-6-4-3-2-min.pdf")
+PYRAMID_EXPECTED = Path("example/2026-09-17/expected.workout.intervals.txt")
 
 
 class PlaniteamToCorosTest(unittest.TestCase):
     def test_parse_planiteam_sample_pdf(self):
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
 
         self.assertIsInstance(workout, Workout)
         self.assertIn("CÔTES COURTES", workout.title)
@@ -19,11 +30,11 @@ class PlaniteamToCorosTest(unittest.TestCase):
         )
 
         intervals_text = workout.to_intervals_icu_text()
-        expected_text = Path("example/expected.workout.intervals.txt").read_text(encoding="utf-8")
+        expected_text = HILL_SPRINTS_EXPECTED.read_text(encoding="utf-8")
         self.assertEqual(intervals_text, expected_text)
 
     def test_warmup_and_cooldown_use_vma_derived_pace(self):
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
 
         warmup, gammes, main_set, cooldown = workout.segments
 
@@ -43,7 +54,7 @@ class PlaniteamToCorosTest(unittest.TestCase):
         # header line is what makes it tag the step for device sync (see
         # CLAUDE.md) - Segment.role drives that header, so it must be set
         # correctly on exactly these two segments.
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
         warmup, gammes, main_set, cooldown = workout.segments
 
         self.assertEqual(warmup.role, "warmup")
@@ -60,7 +71,7 @@ class PlaniteamToCorosTest(unittest.TestCase):
         # step's block name on the COROS device (see CLAUDE.md). Warm-up and
         # cool-down are deliberately left without one since the warmup/
         # cooldown flag alone already gives them a correctly-localised name.
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
         warmup, gammes, main_set, cooldown = workout.segments
 
         self.assertIsNone(warmup.steps[0].cue)
@@ -74,7 +85,7 @@ class PlaniteamToCorosTest(unittest.TestCase):
         )
 
     def test_main_set_is_two_reps_of_six_efforts_with_final_long_recovery(self):
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
         main_set = workout.segments[2]
 
         self.assertEqual(main_set.repeat, 2)
@@ -99,7 +110,7 @@ class PlaniteamToCorosTest(unittest.TestCase):
         # see CLAUDE.md), so the main set targets a pace computed directly
         # from the PDF's own %VMA bands and the given VMA instead - this
         # should hold regardless of the athlete's intervals.icu zone setup.
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
         main_set = workout.segments[2]
 
         for step in main_set.steps:
@@ -108,7 +119,7 @@ class PlaniteamToCorosTest(unittest.TestCase):
 
     def test_total_duration_matches_planiteam_summary(self):
         # The Planiteam UI reports a total duration of 56:40 for this session.
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=SAMPLE_VMA)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
 
         total_seconds = 0
         for segment in workout.segments:
@@ -118,12 +129,78 @@ class PlaniteamToCorosTest(unittest.TestCase):
         self.assertEqual(total_seconds, 56 * 60 + 40)
 
     def test_vma_outside_reference_table_clamps_to_nearest_row(self):
-        workout = parse_planiteam_pdf(SAMPLE_PDF, vma=99.0)
+        workout = parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=99.0)
         warmup = workout.segments[0]
 
         # VMA=99 is far above the table's highest row (23): the pace should
         # clamp to that row rather than extrapolate or crash.
         self.assertEqual(warmup.steps[0].target, "4:21/km")
+
+    def test_parse_raises_instead_of_silently_returning_an_empty_workout(self):
+        # A real production incident: a differently-laid-out PDF (its
+        # section headers didn't wrap onto a second line, shifting the
+        # interval grid's coordinates) made the old fixed-coordinate parser
+        # find zero blocks, which silently produced an empty Workout - and
+        # from there, an empty session pushed to the athlete's watch with no
+        # error anywhere in the pipeline. Forcing that same "nothing found"
+        # condition here (rather than relying on some future PDF still
+        # triggering it) to make sure it now fails loudly instead.
+        with patch("planiteam_to_coros._parse_main_row", return_value=[]):
+            with self.assertRaises(ValueError):
+                parse_planiteam_pdf(HILL_SPRINTS_PDF, vma=SAMPLE_VMA)
+
+    def test_parse_stairs_pdf_with_shifted_grid_coordinates(self):
+        # This PDF's section headers don't wrap onto a second line, so its
+        # interval grid and pace table sit ~9pt higher on the page than the
+        # first sample's - exactly the layout that broke the original
+        # fixed-coordinate row detection (see the test above).
+        workout = parse_planiteam_pdf(STAIRS_PDF, vma=SAMPLE_VMA)
+
+        intervals_text = workout.to_intervals_icu_text()
+        expected_text = STAIRS_EXPECTED.read_text(encoding="utf-8")
+        self.assertEqual(intervals_text, expected_text)
+
+        warmup, drills, main_set, cooldown = workout.segments
+        self.assertEqual(warmup.role, "warmup")
+        self.assertEqual(cooldown.role, "cooldown")
+        # Different pace for warm-up vs cool-down, unlike the other two
+        # samples where the athlete assumed they'd match - confirmed correct
+        # by their alignment with the pace table's own column positions
+        # (left column under the warm-up block, right column under cool-down).
+        self.assertEqual(warmup.steps[0].target, "5:16/km")
+        self.assertEqual(cooldown.steps[0].target, "5:43/km")
+        self.assertEqual(main_set.repeat, 15)
+
+    def test_parse_pyramid_pdf_with_per_step_pace_table(self):
+        # No Z-zone/%VMA overlay at all in this PDF - instead one pace-table
+        # column per session phase (warm-up, each of the 11 main-set
+        # entries, cool-down), a structurally different layout from the
+        # other two samples.
+        workout = parse_planiteam_pdf(PYRAMID_PDF, vma=SAMPLE_VMA)
+
+        intervals_text = workout.to_intervals_icu_text()
+        expected_text = PYRAMID_EXPECTED.read_text(encoding="utf-8")
+        self.assertEqual(intervals_text, expected_text)
+
+        warmup, main_set, cooldown = workout.segments
+        self.assertEqual(warmup.role, "warmup")
+        self.assertEqual(cooldown.role, "cooldown")
+
+        # The PDF's own repeat marker for the pyramid is "1x" (a single
+        # pass) - not repeated, unlike the hill-sprints main set.
+        self.assertEqual(main_set.repeat, 1)
+        self.assertEqual(len(main_set.steps), 11)
+
+        # Alternates Effort/Récupération purely by position, since there's
+        # no zone data here to classify entries by.
+        cues = [step.cue for step in main_set.steps]
+        self.assertEqual(cues, ["Effort", "Récupération"] * 5 + ["Effort"])
+
+        # Durations that aren't a whole number of minutes render as combined
+        # "1m15s"-style tokens, not raw seconds.
+        durations = [step.duration_s for step in main_set.steps]
+        self.assertIn(75, durations)  # 1:15 recovery
+        self.assertIn("1m15s", intervals_text)
 
 
 if __name__ == "__main__":

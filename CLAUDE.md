@@ -23,10 +23,15 @@ never via the flattened text string. `planiteam_to_coros.py` does this
 throughout; `Workout.source_text` keeps the flattened text only for
 debugging/JSON dumps, it is never parsed.
 
-Reference example: `example/cotes-courtes-2x6x20-.pdf`, matching the
-screenshot the user provided when this was built (a "Côtes courtes : 2x6x20""
-session — 20' warm-up, 10' drills, 2×[6×(20s effort/40s jog) with a 3'
-recovery before the second set], 10' cool-down, total 56:40).
+Reference example: `example/2026-09-10/cotes-courtes-2x6x20-.pdf`, matching
+the screenshot the user provided when this was built (a "Côtes courtes :
+2x6x20"" session — 20' warm-up, 10' drills, 2×[6×(20s effort/40s jog) with a
+3' recovery before the second set], 10' cool-down, total 56:40). Two more
+real PDFs arrived later with structurally different layouts
+(`example/2026-09-15/`, `example/2026-09-17/`) - see "Generalizing beyond
+the first sample PDF" near the end of this file for what they broke and how.
+Each `example/<date>/` folder is named after the session's actual date (from
+the notification email, not the PDF - it has no date field, see below).
 
 ## Layout of the page (single page, fixed template)
 
@@ -429,3 +434,141 @@ assuming every workout has a warm-up to borrow from). Verified server-side
 after re-pushing: `workout_doc` shows `{"pace": {"start": 316, "end": 514,
 "units": "secs/km"}}` (5:16 → 8:34) on the recovery steps, `moving_time`
 still 3400.
+
+## Generalizing beyond the first sample PDF
+
+The first PDF (hill sprints, `example/2026-09-10/`) shaped every design
+decision above. Two more real PDFs arrived once the pipeline was live
+(`example/2026-09-15/` stairs, `example/2026-09-17/` a threshold pyramid),
+and both broke assumptions baked in from having only ever seen one sample.
+Worth internalizing: **this PDF template has more variation between
+individual workouts than it first appeared, and a fixed-coordinate approach
+will keep breaking on new ones.** What follows is what actually generalizes
+and what still doesn't.
+
+### Absolute pixel coordinates don't generalize - use relative structure instead
+
+The original `_parse_main_row` filtered words by hardcoded `top` bands
+(`128 <= top <= 136` for durations, `140 <= top <= 150` for the rest row),
+reverse-engineered from the one sample PDF available at the time. The stairs
+PDF's section headers happen not to wrap onto a second line, which shifts
+every row below them up by ~9pt - so the hardcoded bands missed the grid
+entirely. Worse: this failed **silently**. `_parse_main_row` returned an
+empty list, which cascaded to zero segments, an empty `to_intervals_icu_text()`
+string, and - because nothing anywhere checked for this - an actual empty
+session pushed to the athlete's COROS watch, with a real email notification,
+and no error at any layer. This is why `parse_planiteam_pdf` now raises
+`ValueError` when it parses zero segments (see below) - that incident is
+exactly the failure mode that check exists to prevent.
+
+The fix: find these two rows **relative to each other**, not at fixed
+coordinates. Every observed PDF has exactly one row containing `==>` tokens
+(the "rest" row), so `_parse_main_row` now locates that row via
+`_cluster_rows` (which does relative y-clustering already, unaffected by
+this bug) and walks upward from it to find the duration row. That walk isn't
+simply "one row up", either: the pace table's own `VMA` column-header label
+sits, on some PDFs, as its own single-word row squeezed into the gap between
+the duration row and the rest row - so the code walks upward past any row
+that doesn't contain an `Nx` repeat marker, rather than assuming adjacency.
+Both quirks were only found by actually diffing what broke against what
+worked, not by inspecting one PDF in isolation.
+
+The pace table had the same class of bug, for a different reason: its row
+grouping used a fixed clustering tolerance (`tol=1.5`) to merge a row's VMA
+label with its pace values, but the vertical offset between them varies by
+PDF (0.4-2.2pt observed) - tight enough that the stairs PDF's ~2.2pt offset
+fell outside the old tolerance and silently dropped every row. Fixed by
+anchoring differently: find each VMA-label word (leftmost column, `x0 < 90`,
+matching the numeric label pattern) directly, then gather pace-shaped tokens
+within a generous `±6pt` vertical window of *that specific label* - decoupled
+from the generic row-clustering primitive entirely, since this relationship
+(a label and its own row's values) needed a wider tolerance than everything
+else on the page.
+
+### `ÉCHAUFFEMENT` wraps at a different letter on every PDF - don't chase exact splits
+
+Three PDFs, three different line-wrap points for the same French word:
+`ÉCHAUFFEM`/`ENT` (first sample), `ÉCHAUFFEME`/`NT` (pyramid). Chasing exact
+fragment pairs in `_HEADER_JOIN_FIXUPS` doesn't scale - there's no way to
+predict where Planiteam's renderer will break a word next. Since warm-up/
+cool-down role detection is the only thing that actually depends on getting
+this right (the section's *name* is never shown - see below), the fix was
+to make that specific check tolerant instead of trying to perfectly
+reconstruct the joined text: strip whitespace from the header text before
+substring-matching `CHAUFFEMENT`/`CALME`. `ÉCHAUFFEME NT` (imperfectly
+joined, extra space) still matches `CHAUFFEMENT` once spaces are stripped,
+regardless of exactly where the PDF wrapped the word. `_HEADER_JOIN_FIXUPS`
+is left in place for the cases it already handles (cosmetic `Segment.name`
+values, e.g. in JSON output) but is no longer load-bearing for correctness.
+
+### A second, structurally different pace-table layout exists
+
+The pyramid PDF (`seuil-pyramide-2-4-6-4-3-2-min.pdf`) has **no `Z\d` zone
+labels and no `%VMA` overlay anywhere on the page.** Instead its pace table
+has one column *per session phase* - warm-up, each of the 6 efforts, each of
+the 5 recoveries, cool-down: 13 columns total, each independently computed
+per VMA row (confirmed by checking column values against x-position
+alignment with each phase's block above, the same technique used to
+originally confirm the 2-column layout against a screenshot). The two
+zone-based PDFs only ever print 2 pace columns (warm-up, cool-down) plus a
+separate zone/percent overlay for the main set.
+
+`parse_planiteam_pdf` now dispatches between the two modes:
+
+```python
+pace_table_columns = len(next(iter(pace_table.values()), []))
+total_flat_entries = sum(len(block["entries"]) for block in blocks)
+use_per_step_pace = not zones and pace_table_columns > 2 and pace_table_columns == total_flat_entries
+```
+
+i.e.: no zone overlay was found, *and* the pace table's column count exactly
+matches the total number of entries across every block on the page (13 for
+the pyramid: 1 warm-up + 11 main-set + 1 cool-down). When true, each entry's
+target is looked up directly from its corresponding pace-table column via a
+single running `flat_index` cursor that increments across the whole
+workout, in page order - not just within the main block, since the count
+check only holds when warm-up and cool-down's own entries are included in
+the flattened total too.
+
+Effort/recovery classification in this mode has no zone data to lean on, so
+it falls back to positional alternation: the first entry of a multi-entry,
+non-warmup/cooldown block is `"Effort"`, then alternates. This held for
+every workout seen so far (every one starts with an effort), but is a weaker
+assumption than the zone-based path's `_zone_cue` (which compares actual
+zone numbers) - a workout that opened with a recovery would get this wrong,
+and there'd be no way to detect that from a per-step-mode PDF alone.
+
+**Known gap, not yet built**: every per-step-mode PDF seen so far has all
+`r = 0` (blank) rest values within its main block - i.e. no analogue to the
+hill-sprint PDF's trailing `r = 3:00`. If a future per-step PDF combines
+both a nonzero trailing rest *and* per-step pace columns, there's currently
+no code path attributing a pace-table column to that extra step - it's
+appended with `target=None` rather than guessing. Revisit if that PDF shows up.
+
+### Duration formatting needed a combined "1m15s" form
+
+The pyramid's recovery durations (1:15, 1:45, 1:30) aren't whole minutes or
+under 60 seconds, so `_format_duration`'s old two-case logic (`"Nm"` or
+`"Ns"`) had no representation for them - it would have emitted raw seconds
+(`"75s"`) instead. Extended to a third case (`"NmNs"`) and verified live the
+same way every other syntax question in this file was: pushed a probe with
+`1m15s`/`1m45s` targets, read `workout_doc` back, confirmed exact 75s/105s
+durations and a correct `moving_time` total. Confirmed working, not assumed.
+
+### Verifying against real data beats guessing, even for "obvious" assumptions
+
+The stairs PDF's warm-up and cool-down initially looked ambiguous: the
+athlete's hand-typed expected file had both at the same pace (`5:43/km`),
+while the parser computed two different values (`5:16/km` / `5:43/km`).
+Rather than trust either blindly, the pace table's *column x-positions* were
+checked directly against the page: the left pace column sits at the same x
+as the warm-up block's `20:00` duration (under the `ÉCHAUFFEMENT` header),
+and the right column sits at the same x as the cool-down block's `10:00`
+(under `RETOUR AU CALME`). That's independent structural evidence for
+"left column = warm-up, right column = cool-down" beyond the one screenshot
+cross-check the original 2-column assumption was based on - and it disagreed
+with the hand-typed expectation, which turned out to be an unverified guess
+rather than a checked value. Worth remembering: a human-provided "expected"
+file is a hypothesis to check against the source data, not automatically
+ground truth, even when it's the more conservative-looking answer (both
+values equal felt like the "safe" guess here, but wasn't the correct one).
