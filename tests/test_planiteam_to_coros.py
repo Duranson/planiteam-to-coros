@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from planiteam_to_coros import Workout, parse_planiteam_pdf
+from planiteam_to_coros import Segment, Step, Workout, parse_planiteam_pdf
 
 SAMPLE_VMA = 17.5
 
@@ -201,6 +201,22 @@ class PlaniteamToCorosTest(unittest.TestCase):
         durations = [step.duration_s for step in main_set.steps]
         self.assertIn(75, durations)  # 1:15 recovery
         self.assertIn("1m15s", intervals_text)
+
+    def test_multi_step_segment_gets_repeat_header_even_at_1x(self):
+        # The athlete's own preference (confirmed live: verified a "1x"
+        # header parses correctly, workout_doc shows {"reps": 1, ...}): a
+        # multi-step "core" block reads as a repeat of one, even with no
+        # warm-up/cool-down around it - not a bare list of steps. Verified
+        # against the pyramid PDF's real main set, whose own repeat marker
+        # is "1x". A single-step segment (warm-up, cool-down, a plain drills
+        # block) never gets a header regardless of its repeat count -
+        # there's nothing to group.
+        multi_step = Segment(name="Core", repeat=1, steps=[Step(duration_s=30), Step(duration_s=30)])
+        single_step = Segment(name="Drills", repeat=1, steps=[Step(duration_s=600)])
+        text = Workout(title="t", segments=[multi_step, single_step]).to_intervals_icu_text()
+
+        self.assertTrue(text.startswith("1x\n"))
+        self.assertNotIn("1x\n- 10m", text)  # the single-step segment stays unwrapped
 
 
 if __name__ == "__main__":

@@ -143,6 +143,14 @@ class Workout:
         guide asks for a blank line before and after each repeat block -
         joining every segment with a blank line satisfies that generally.
 
+        The "Nx" header is shown whenever a segment has more than one step -
+        i.e. it's a real interval structure - even when ``repeat`` is 1
+        (explicitly preferred over hiding a "1x" header: a lone
+        multi-step "core" block, with no warm-up/cool-down around it, reads
+        as a repeat of one rather than a bare list of steps). A segment with
+        only one step (warm-up, cool-down, a plain drills block) never gets
+        one, regardless of its repeat count - there's nothing to group.
+
         A segment whose ``role`` is "warmup"/"cooldown" gets that literal
         English keyword as its own header line (verified live: this, and
         only this, is what makes intervals.icu tag the step as warmup/
@@ -154,7 +162,7 @@ class Workout:
         blocks: List[str] = []
         for segment in self.segments:
             step_lines = "\n".join(f"- {step.render()}" for step in segment.steps)
-            if segment.repeat > 1:
+            if len(segment.steps) > 1:
                 body = f"{segment.repeat}x\n{step_lines}"
             else:
                 body = step_lines

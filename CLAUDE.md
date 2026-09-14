@@ -572,3 +572,24 @@ rather than a checked value. Worth remembering: a human-provided "expected"
 file is a hypothesis to check against the source data, not automatically
 ground truth, even when it's the more conservative-looking answer (both
 values equal felt like the "safe" guess here, but wasn't the correct one).
+
+### A multi-step segment gets its "Nx" header even at 1x
+
+Product decision (the athlete's, not derived from any PDF data): a segment
+gets its repeat header (`"1x"`, `"2x"`, ...) whenever it has **more than one
+step**, not only when `repeat > 1`. Originally `to_intervals_icu_text()`
+hid the header whenever `repeat == 1` (the pyramid's own main-set marker,
+since it's a single pass), rendering it as a bare list of steps with no
+grouping at all. The preference, after seeing that rendered: a "core"
+block - the pyramid's main set has no warm-up/cool-down immediately
+recognisable around each rep the way the hill-sprints' `2x` block does -
+should still visually read as one repeated group, "repeated once", rather
+than an undifferentiated list. A single-step segment (warm-up, cool-down, a
+plain drills block like `GAMMES`) never gets a header regardless of its own
+repeat count - there's nothing to group in a single instruction.
+
+Implemented as `len(segment.steps) > 1` replacing the old `segment.repeat > 1`
+condition. Verified live the same way as every other syntax question here:
+pushed a probe with a bare `1x` header, confirmed `workout_doc` shows
+`{"reps": 1, ...}` (not silently dropped or misparsed), then re-pushed the
+real pyramid event with the corrected format and deleted the stale one.
