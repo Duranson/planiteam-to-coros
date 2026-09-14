@@ -476,6 +476,24 @@ def _zone_cue(zone: str, max_zone: int) -> str:
     return "Effort" if _zone_number(zone) >= max_zone else "Récupération"
 
 
+def _alternating_cue(index: int) -> str:
+    # Used where there's no zone data to classify entries by (see
+    # ``use_per_step_pace`` in parse_planiteam_pdf) - effort/recovery is
+    # inferred purely by position instead: every workout seen so far starts
+    # with an effort and alternates from there.
+    return "Effort" if index % 2 == 0 else "Récupération"
+
+
+def _plain_block_cue(role: Optional[str], name: str) -> Optional[str]:
+    # A single-purpose block with no alternating effort/recovery structure.
+    # Warm-up/cool-down already get a correctly-localised block name on the
+    # device from the warmup/cooldown flag alone (confirmed live - see
+    # CLAUDE.md), so no extra cue is added there. Anything else (e.g.
+    # Planiteam's "GAMMES" drills) has no such flag, so its own section name
+    # becomes the cue - generic to whatever a future PDF calls that block.
+    return None if role else _display_name(name)
+
+
 def _apply_zone_targets(
     entries: List[Tuple[int, Optional[int]]],
     zones: List[str],
@@ -571,16 +589,15 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
         if is_zone_main_set:
             steps = _apply_zone_targets(block["entries"], zones, percents, vma)
         elif use_per_step_pace:
-            # No zone/percent overlay exists to classify entries, so a block
-            # with more than one entry (and no warmup/cooldown role) is
-            # assumed to be the alternating effort/recovery main set -
-            # starting with an effort, same as every workout seen so far.
+            # A block with more than one entry and no warmup/cooldown role
+            # is assumed to be the alternating effort/recovery main set -
+            # see _alternating_cue for why "alternating" is a safe read here.
             is_alternating = role is None and len(block["entries"]) > 1
             steps = []
             for i, (duration_s, rest_s) in enumerate(block["entries"]):
                 target = _format_pace(_lookup_pace(pace_table, vma, column=flat_index))
                 flat_index += 1
-                cue = ("Effort" if i % 2 == 0 else "Récupération") if is_alternating else (None if role else _display_name(name))
+                cue = _alternating_cue(i) if is_alternating else _plain_block_cue(role, name)
                 steps.append(Step(duration_s=duration_s, target=target, cue=cue))
                 if rest_s:
                     # Not observed in any per-step PDF so far (their rest
@@ -589,14 +606,7 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
                     # guessing.
                     steps.append(Step(duration_s=rest_s, target=None, cue=cue))
         else:
-            # Warm-up/cool-down already get a correctly-localised block name
-            # on the device from the warmup/cooldown flag alone (confirmed
-            # live - see CLAUDE.md), so no extra cue is added there. Any
-            # other single-step block (e.g. Planiteam's "GAMMES" drills) has
-            # no such flag available, so its own section name becomes the
-            # cue - generic to whatever a future PDF calls that block, not
-            # specific to this one.
-            cue = None if role else _display_name(name)
+            cue = _plain_block_cue(role, name)
             steps = []
             for duration_s, rest_s in block["entries"]:
                 if role == "warmup" and warmup_pace is not None:
