@@ -593,3 +593,80 @@ condition. Verified live the same way as every other syntax question here:
 pushed a probe with a bare `1x` header, confirmed `workout_doc` shows
 `{"reps": 1, ...}` (not silently dropped or misparsed), then re-pushed the
 real pyramid event with the corrected format and deleted the stale one.
+
+## Sharing sessions with a training club (multi-recipient push)
+
+The original pipeline assumed one athlete = one intervals.icu account. The
+club use case is the same coach's session pushed to several club members at
+once, each with their own VMA (which changes the computed pace targets, see
+above) and their own intervals.icu account (so it lands on *their* COROS
+watch, not just the repo owner's).
+
+### Data model: `Recipient`, not per-athlete config files
+
+`planiteam_to_coros.Recipient` (`name`, `vma`, `api_key`, `athlete_id`,
+`enabled`) is intentionally a flat dataclass with no per-recipient identity
+beyond a display name - there's no user-account system here, no auth beyond
+"whoever holds `RECIPIENTS_JSON` can edit the list." `enabled` exists purely
+so someone can be paused (e.g. travelling) without deleting and later
+re-typing their credentials.
+
+`parse_recipients(raw: str)` parses the whole list from one JSON string and
+raises `ValueError` - not a silent skip - on malformed JSON or a missing
+required field, on purpose: a typo'd entry should fail the *whole* request
+loudly (see below) rather than quietly dropping one person from every future
+push with no indication why their watch stopped getting sessions.
+
+### Why one JSON blob instead of one secret (or one file) per recipient
+
+The natural-looking alternative - a Secret Manager secret per recipient,
+mirroring how `INTERVALS_ICU_API_KEY`/`INTERVALS_ICU_ATHLETE_ID` used to
+each be their own secret - was rejected because `gcloud functions deploy
+--set-secrets` requires every secret binding to be named explicitly in the
+deploy command. Adding a recipient would then mean editing
+`.github/workflows/deploy.yml` (and the manual deploy command in
+DEPLOYMENT.md) *and* granting IAM access *and* pushing a code change, just
+to add one person - directly against the stated goal of this being easy to
+add/remove people.
+
+Collapsing the whole list into a single `RECIPIENTS_JSON` secret means the
+`--set-secrets` binding is written once and never touched again: adding or
+removing someone is purely a data change (`gcloud secrets versions add
+RECIPIENTS_JSON --data-file=recipients.json`), not a deploy-config change.
+This relies on a real Cloud Run/Cloud Functions Gen2 property (not just
+assumed from the OpenAPI-docs-aren't-enough lesson elsewhere in this file,
+but documented Google behaviour worth flagging as unverified-live-here): a
+`:latest`-pinned secret is resolved when an instance *starts*, not baked in
+at deploy time - so a new secret version reaches the function on its next
+cold start, no redeploy required. An already-warm instance keeps its
+already-loaded value until it recycles.
+
+Locally, the same `RECIPIENTS_JSON` shape is just another `.env` line (or,
+per DEPLOYMENT.md, a gitignored `recipients.json` used to seed the secret) -
+same `parse_recipients()` code path reads it whether the value came from
+dotenv or Secret Manager, exactly like the single-athlete credentials always
+worked.
+
+### Per-recipient failure isolation, not all-or-nothing
+
+`push_to_recipients()` re-parses the PDF once per enabled recipient (not
+just re-pushes a shared `Workout`) because `vma` changes the computed pace
+targets - each recipient's targets are genuinely different data, not just a
+different destination account. Each recipient's parse+push is wrapped in its
+own `try`/`except`; one recipient's failure (revoked key, some VMA-specific
+parse edge case) is captured into that recipient's own `PushResult` rather
+than raising and aborting the loop.
+
+This was a deliberate product choice, not the obvious default: the athlete
+explicitly preferred isolating failures over failing the whole run, since
+the whole point is that other people's setups (which the repo owner doesn't
+control) can break independently of the PDF/parser itself, and one broken
+account shouldn't hold the rest of the club's session hostage. `main.py`
+reflects this in its status code: the whole request only fails (502, which
+makes Apps Script label the email `PlaniTeam-Sync-Error` and retry-eligible)
+when **every** recipient failed - a partial failure still returns 200 (email
+marked read) with a `results` array documenting who did and didn't get
+pushed. Per-recipient failures are surfaced only via the Cloud Function's
+own logs (`print()`, one line per recipient, by name - matching the
+explicit ask to be able to identify whose setup is broken) and the response
+body; there's no separate alerting channel for this, and none was asked for.

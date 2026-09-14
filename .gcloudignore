@@ -1,7 +1,8 @@
 # Files excluded from the Cloud Function deployment bundle.
-# Critically: .env holds real secrets and must never be uploaded - the
-# deployed function gets credentials via --set-secrets instead.
+# Critically: .env / recipients.json hold real secrets and must never be
+# uploaded - the deployed function gets credentials via --set-secrets instead.
 .env
+recipients.json
 .venv/
 __pycache__/
 *.pyc
@@ -14,3 +15,4 @@ CLAUDE.md
 DEPLOYMENT.md
 README.md
 apps_script/
+manage_recipients.py

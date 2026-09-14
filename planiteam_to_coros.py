@@ -36,6 +36,17 @@ try:
 except ImportError:  # pragma: no cover - dotenv is a convenience, not a hard requirement
     pass
 
+# In the cloud, RECIPIENTS_JSON is bound directly as an env var from Secret
+# Manager (see main.py/DEPLOYMENT.md). Locally there's no secret manager, so
+# a gitignored recipients.json file (same shape, see DEPLOYMENT.md "Build
+# your recipients list") is read into the same env var here - mirroring how
+# python-dotenv above transparently populates env vars from .env. This means
+# every consumer (main.py, the CLI) can just read os.environ["RECIPIENTS_JSON"]
+# without caring whether it came from Secret Manager or this local file.
+_LOCAL_RECIPIENTS_FILE = Path("recipients.json")
+if "RECIPIENTS_JSON" not in os.environ and _LOCAL_RECIPIENTS_FILE.exists():
+    os.environ["RECIPIENTS_JSON"] = _LOCAL_RECIPIENTS_FILE.read_text(encoding="utf-8")
+
 
 # The athlete's VMA (km/h) is not stored in the PDF: Planiteam prints a
 # reference table for a range of VMA values and expects the athlete to read
@@ -679,6 +690,104 @@ def push_event(
     return response.json()
 
 
+@dataclass
+class Recipient:
+    """One club member to push a shared session to.
+
+    Loaded from the ``RECIPIENTS_JSON`` env var - a JSON array, kept out of
+    git the same way the single-athlete credentials always were (a
+    gitignored ``.env`` locally, a Secret Manager secret in the cloud - see
+    DEPLOYMENT.md/CLAUDE.md). ``vma`` is per-recipient because it directly
+    changes the computed pace targets (see ``_vma_pace_target``); ``enabled``
+    lets someone be paused (e.g. travelling) without losing their config.
+    """
+
+    name: str
+    vma: float
+    api_key: str
+    athlete_id: str
+    enabled: bool = True
+
+
+def parse_recipients(raw: str) -> List[Recipient]:
+    """Parse the ``RECIPIENTS_JSON`` env var into a list of Recipients.
+
+    Raises ``ValueError`` on malformed JSON or a missing required field, so
+    a typo in the list fails loudly at request time rather than silently
+    dropping someone from the club-wide push.
+    """
+
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"RECIPIENTS_JSON is not valid JSON: {exc}") from exc
+
+    recipients = []
+    for i, entry in enumerate(entries):
+        try:
+            recipients.append(
+                Recipient(
+                    name=entry["name"],
+                    vma=float(entry["vma"]),
+                    api_key=entry["api_key"],
+                    athlete_id=str(entry["athlete_id"]),
+                    enabled=bool(entry.get("enabled", True)),
+                )
+            )
+        except KeyError as exc:
+            raise ValueError(f"RECIPIENTS_JSON entry #{i} is missing required field {exc}") from exc
+    return recipients
+
+
+@dataclass
+class PushResult:
+    """Outcome of pushing to one recipient - see ``push_to_recipients``."""
+
+    name: str
+    ok: bool
+    event_id: Optional[int] = None
+    title: Optional[str] = None
+    error: Optional[str] = None
+
+
+def push_to_recipients(
+    pdf_path: Union[str, Path],
+    *,
+    date: str,
+    recipients: Sequence[Recipient],
+    sport: str = "Run",
+    base_url: str = INTERVALS_ICU_BASE_URL,
+) -> List[PushResult]:
+    """Parse the PDF once per enabled recipient and push to each of their
+    intervals.icu accounts independently.
+
+    The PDF is re-parsed per recipient (not just re-pushed) because ``vma``
+    changes the computed pace targets. One recipient's failure - a revoked
+    key, a network hiccup - is caught and reported in that recipient's
+    result rather than aborting everyone else's push; the caller decides
+    what a partial failure means for the overall request (see main.py).
+    """
+
+    results = []
+    for recipient in recipients:
+        if not recipient.enabled:
+            continue
+        try:
+            workout = parse_planiteam_pdf(pdf_path, vma=recipient.vma)
+            event = push_event(
+                workout,
+                date=date,
+                athlete_id=recipient.athlete_id,
+                api_key=recipient.api_key,
+                sport=sport,
+                base_url=base_url,
+            )
+            results.append(PushResult(name=recipient.name, ok=True, event_id=event.get("id"), title=workout.title))
+        except Exception as exc:  # boundary: one recipient's account/PDF edge case shouldn't sink the rest
+            results.append(PushResult(name=recipient.name, ok=False, error=str(exc)))
+    return results
+
+
 def cli(argv: Optional[Sequence[str]] = None) -> int:
     """CLI wrapper for invoking the converter from the command line."""
 
@@ -695,12 +804,45 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--push",
         action="store_true",
-        help="Also push the workout to intervals.icu as a planned event, via its API. "
+        help="Also push the workout to intervals.icu as a planned event, via its API, to your own single account. "
         "Requires INTERVALS_ICU_API_KEY and INTERVALS_ICU_ATHLETE_ID (env vars or .env file) and --date.",
     )
-    parser.add_argument("--date", type=str, default=None, help="Local date (YYYY-MM-DD) to schedule the event on. Required with --push.")
+    parser.add_argument(
+        "--push-recipients",
+        action="store_true",
+        help="Push to every enabled recipient in RECIPIENTS_JSON instead of a single account - the same "
+        "logic main.py runs in the cloud, useful for testing a recipients.json/RECIPIENTS_JSON change "
+        "locally before deploying. Requires --date. Ignores --vma (each recipient's own vma is used).",
+    )
+    parser.add_argument("--date", type=str, default=None, help="Local date (YYYY-MM-DD) to schedule the event on. Required with --push/--push-recipients.")
     parser.add_argument("--sport", type=str, default="Run", help="intervals.icu sport type for the pushed event (default: %(default)s).")
     args = parser.parse_args(argv)
+
+    if args.push and args.push_recipients:
+        parser.error("--push and --push-recipients are mutually exclusive.")
+
+    if args.push_recipients:
+        if not args.date:
+            parser.error("--push-recipients requires --date YYYY-MM-DD (the PDF has no session date).")
+        raw = os.environ.get("RECIPIENTS_JSON")
+        if not raw:
+            parser.error(
+                "--push-recipients requires RECIPIENTS_JSON to be set - either a recipients.json file "
+                "in the current directory, or a RECIPIENTS_JSON env var/.env line (see DEPLOYMENT.md)."
+            )
+        try:
+            recipients = parse_recipients(raw)
+        except ValueError as exc:
+            parser.error(str(exc))
+        results = push_to_recipients(args.pdf, date=args.date, recipients=recipients, sport=args.sport)
+        if not results:
+            parser.error("No enabled recipients in RECIPIENTS_JSON.")
+        for result in results:
+            if result.ok:
+                print(f"Pushed to {result.name}: event id {result.event_id} ({result.title})")
+            else:
+                print(f"FAILED to push to {result.name}: {result.error}")
+        return 0 if any(r.ok for r in results) else 1
 
     workout = parse_planiteam_pdf(args.pdf, vma=args.vma)
     payload = workout.to_coros_json() if args.format == "json" else workout.to_intervals_icu_text()

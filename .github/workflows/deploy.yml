@@ -58,4 +58,4 @@ jobs:
             --entry-point=handle_planiteam_email \
             --trigger-http \
             --allow-unauthenticated \
-            --set-secrets="INTERVALS_ICU_API_KEY=INTERVALS_ICU_API_KEY:latest,INTERVALS_ICU_ATHLETE_ID=INTERVALS_ICU_ATHLETE_ID:latest,VMA=VMA:latest,SHARED_SECRET=SHARED_SECRET:latest"
+            --set-secrets="RECIPIENTS_JSON=RECIPIENTS_JSON:latest,SHARED_SECRET=SHARED_SECRET:latest"

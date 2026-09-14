@@ -70,12 +70,23 @@ extracts the PDF and session date, and hands them to a small Cloud Function
 that runs the same parsing/push logic. Nothing depends on any local machine
 being on. See [DEPLOYMENT.md](DEPLOYMENT.md) for the full setup walkthrough.
 
+The Cloud Function can push the same session to more than one intervals.icu
+account - useful for sharing a coach's session with a training club, since
+each member typically has their own VMA. Recipients (name, VMA, their own
+intervals.icu API key + athlete id) are an explicit list kept in a
+gitignored `recipients.json`, stored as a single Secret Manager secret so it
+never reaches the public repo - see "Build your recipients list" in
+[DEPLOYMENT.md](DEPLOYMENT.md). Each recipient is parsed (with their own
+VMA) and pushed independently, so one person's revoked key doesn't block
+the rest of the club.
+
 ## Repository layout
 
 | Path | What |
 |---|---|
 | `planiteam_to_coros.py` | The parser and intervals.icu client - the core of this repo. |
 | `main.py` | Cloud Function entry point for the Gmail automation. |
+| `manage_recipients.py` | Publishes `recipients.json` to the `RECIPIENTS_JSON` Secret Manager secret. |
 | `apps_script/Code.gs` | The Gmail-watching side of that automation. |
 | `tests/` | Tests against the real sample PDF, including cross-checks against the app's own displayed totals. |
 | `example/` | A real (anonymised) sample PDF and its expected parsed output. |

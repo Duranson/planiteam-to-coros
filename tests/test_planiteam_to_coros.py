@@ -2,7 +2,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from planiteam_to_coros import Segment, Step, Workout, parse_planiteam_pdf
+from planiteam_to_coros import (
+    Segment,
+    Step,
+    Workout,
+    parse_planiteam_pdf,
+    parse_recipients,
+    push_to_recipients,
+)
 
 SAMPLE_VMA = 17.5
 
@@ -217,6 +224,59 @@ class PlaniteamToCorosTest(unittest.TestCase):
 
         self.assertTrue(text.startswith("1x\n"))
         self.assertNotIn("1x\n- 10m", text)  # the single-step segment stays unwrapped
+
+    def test_parse_recipients_reads_valid_list(self):
+        raw = """
+        [
+            {"name": "Fabien", "vma": 17.5, "api_key": "k1", "athlete_id": "a1"},
+            {"name": "Alex", "vma": 15.0, "api_key": "k2", "athlete_id": "a2", "enabled": false}
+        ]
+        """
+        recipients = parse_recipients(raw)
+
+        self.assertEqual([r.name for r in recipients], ["Fabien", "Alex"])
+        self.assertEqual(recipients[0].vma, 17.5)
+        self.assertTrue(recipients[0].enabled)  # defaults to True when omitted
+        self.assertFalse(recipients[1].enabled)
+
+    def test_parse_recipients_rejects_malformed_json(self):
+        with self.assertRaises(ValueError):
+            parse_recipients("not json")
+
+    def test_parse_recipients_rejects_entry_missing_a_field(self):
+        # A typo'd/incomplete entry should fail loudly rather than silently
+        # dropping someone from the club-wide push.
+        with self.assertRaises(ValueError):
+            parse_recipients('[{"name": "Fabien", "vma": 17.5, "api_key": "k1"}]')
+
+    def test_push_to_recipients_skips_disabled_and_isolates_failures(self):
+        # One recipient's push failing (bad key, network hiccup) must not
+        # stop the others from getting pushed - see CLAUDE.md/DEPLOYMENT.md
+        # on why per-recipient failures are isolated rather than aborting
+        # the whole club-wide run.
+        recipients = parse_recipients(
+            """
+            [
+                {"name": "Works", "vma": 17.5, "api_key": "k1", "athlete_id": "a1"},
+                {"name": "Broken", "vma": 15.0, "api_key": "k2", "athlete_id": "a2"},
+                {"name": "Paused", "vma": 16.0, "api_key": "k3", "athlete_id": "a3", "enabled": false}
+            ]
+            """
+        )
+
+        def fake_push_event(workout, *, date, athlete_id, api_key, sport="Run", base_url=None):
+            if athlete_id == "a2":
+                raise RuntimeError("401 Unauthorized")
+            return {"id": 42}
+
+        with patch("planiteam_to_coros.push_event", side_effect=fake_push_event):
+            results = push_to_recipients(HILL_SPRINTS_PDF, date="2026-09-10", recipients=recipients)
+
+        self.assertEqual([r.name for r in results], ["Works", "Broken"])  # Paused is skipped entirely
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].event_id, 42)
+        self.assertFalse(results[1].ok)
+        self.assertIn("401", results[1].error)
 
 
 if __name__ == "__main__":

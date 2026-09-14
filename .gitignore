@@ -1,3 +1,4 @@
 .env
+recipients.json
 __pycache__/
 *.pyc
