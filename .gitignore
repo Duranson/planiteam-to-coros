@@ -2,3 +2,6 @@
 recipients.json
 __pycache__/
 *.pyc
+
+# For any personal reminders or notes
+.cheatsheet
