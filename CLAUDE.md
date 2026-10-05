@@ -174,6 +174,17 @@ accented text while debugging in this shell.
   `None` — the PDF only has an "edited on" date, not the scheduled session
   date, and there is nowhere else in this repo's inputs to source it from
   (would need to come from a CLI flag or Planiteam calendar export instead).
+- Dropping a new PDF + a hand-checked `expected.workout.intervals.txt` into
+  its own `example/<date>/` folder is enough to get a test for it — no code
+  change needed. `tests/test_examples.py` discovers every `example/*/`
+  folder at import time and attaches one dynamically-named test method per
+  folder (`test_2026_09_10`, ...), individually runnable from VSCode's
+  Testing tab (wired up via `.vscode/settings.json`, `unittest` discovery —
+  not pytest, to avoid a new dependency). Each run always writes that
+  folder's rendered output to `actual.workout.intervals.txt` (gitignored)
+  next to the PDF, pass or fail, so a mismatch can be diffed directly
+  against `expected.workout.intervals.txt` in the editor instead of reading
+  it out of a test failure message.
 
 ## Pushing to intervals.icu
 
@@ -670,3 +681,215 @@ pushed. Per-recipient failures are surfaced only via the Cloud Function's
 own logs (`print()`, one line per recipient, by name - matching the
 explicit ask to be able to identify whose setup is broken) and the response
 body; there's no separate alerting channel for this, and none was asked for.
+
+## A third round of real PDFs broke the flat-count/sequential-index approach
+
+Six more real PDFs arrived (`example/2026-09-22` through `example/2026-10-08`),
+most producing silently-wrong or empty output. The common root cause: almost
+every piece of per-entry matching in the parser (pairing a duration to its
+own "r = rest" value, a Z-zone/%VMA overlay token to its entry, a pace-table
+column to its entry) was done either by a **flat sequential index** (consume
+the next item off a shared iterator/counter) or by a **flat count comparison**
+(this block's entry count equals the *whole page's* zone-token count). Both
+assumptions broke as soon as a PDF had more than one zoned block, an extra
+placeholder entry, or a shifted table. See `ARCHITECTURE.md` for the current
+per-block dispatch shape this section explains the reasoning behind.
+
+**The fix, applied uniformly**: every one of these pairings is now done by
+**nearest x-position** (`_nearest_payload`/`_nearest_column_index`/
+`_consume_nearest_rest`, tolerance `_X0_MATCH_TOL = 20pt`), never by a flat
+index or whole-page count. Measured offsets between a real entry and its own
+rest-group/zone/percent/pace-column are consistently 2-12pt across every
+sample seen; the next *other* real entry is never closer than ~48pt. That
+margin is comfortable, but it is specific to this template's grid spacing -
+if a future PDF packs entries tighter than that, this tolerance would need
+revisiting (dump the words and check the actual spacing before assuming).
+
+### "Consigne" free-text notes leave an orphaned "r = 0" that desyncs sequential pairing
+
+Two PDFs print a "Consigne" annotation word inline on the duration row
+(instead of, or alongside, a real duration), with its own unused
+`r`/`=`/`0` triple on the rest row beneath it. A purely sequential
+"consume the next rest value for the next duration token" pairing (the
+original implementation) silently shifts every *subsequent* rest value by
+one as soon as it skips over the non-duration "Consigne" token - wrong
+recovery values on every following entry, with no error anywhere. Matching
+each entry to its *nearest* rest-group by x0 instead makes the orphaned
+group simply match nothing (it's 100+pt from the nearest real entry, far
+outside tolerance) and everything else resolves correctly. See
+`_parse_rest_groups`/`_consume_nearest_rest`.
+
+When "Consigne" gets its own `1x` block (no real duration follows before the
+next repeat marker), that block parses to zero entries. `parse_planiteam_pdf`
+now skips any zero-entry block outright (no Segment is created) rather than
+rendering an empty stub - confirmed correct against two PDFs where the
+corresponding section header (always "GAMMES") has no line at all in the
+athlete's own expected output for that session.
+
+### VMA-split distance entries ("500m", "1.0km") and the correct intervals.icu syntax
+
+Some workouts (VMA-interval or long-tempo sessions) specify a main-set
+entry as a **distance** instead of a time - e.g. "500m", "300m", "1.0km" on
+the duration row, parsed via `_DISTANCE_M_RE`/`_DISTANCE_KM_RE` into
+`entry["distance_m"]` (with `entry["duration_s"]` left `None`) and rendered
+by `Step.render()`/`_format_distance()` instead of `_format_duration()`.
+
+The intervals.icu text syntax for this was **not guessed** - pulled from the
+same forum guide already cited elsewhere in this file
+(https://forum.intervals.icu/t/workout-builder-syntax-quick-guide/123701,
+fetched via its Discourse JSON endpoint, `<url>.json`, since a plain `curl`
+of the HTML only returns the client-side app shell with no post content) and
+then **verified live** the same way every other syntax question in this repo
+has been: pushed a probe with `500mtr 3:26/km Pace` and `1.0km 3:54/km Pace`
+steps, `GET` the event back, confirmed `workout_doc` shows
+`{"distance": 500, "pace": {...}}` and `{"distance": 1000, "pace": {...}}`
+respectively (not a bogus 500/1000-*minute* step, which is what a bare "m"
+or no unit at all would have silently produced - CLAUDE.md's own earlier
+"`m` means minutes, not meters" trap applies here just as much as to a plain
+duration). The required distance suffix is **`mtr`**, not `m` (a bare `m`
+is minutes) and not `mt` (an earlier guess in this repo, before this was
+checked - wrong, never actually tried against the API). `km` works directly,
+decimals included (`"1.0km"` parses to a real 1000m distance step).
+
+### The pace table can have a *third* column kind: a raw split-time, not a pace/km
+
+Previously `_parse_pace_table` only recognised apostrophe-formatted cells
+(`"7'42/km"`) as pace data. One PDF (`6-a-8x1000m-avec-relances`) prints a
+*third* table column in plain `mm:ss` colon format (e.g. `"05:41"`) for the
+distance-based main-set entries - this is the time to cover *that block's
+own distance* at each VMA row, not a pace/km value, even though for a
+1000m-distance block the two happen to be numerically identical (so it was
+easy to miss the distinction from one example alone). A second PDF
+(`vma-6x500m-6x300m-avec-relances`) confirmed the distinction matters: its
+own raw columns are split times for 500m and 300m respectively, and must be
+rescaled by `seconds * 1000 / distance_m` before they're a valid pace/km -
+using them unscaled would understate the pace (e.g. a 300m split read
+directly as if it were a per-km pace).
+
+`_parse_pace_table` now tags every cell with a `kind` (`"pace"` for
+apostrophe format, used as-is; `"raw"` for colon format, rescaled by
+`_pace_cell_to_target` using the *consuming entry's own* `distance_m` -
+`None`/no rescale when the entry is time-based, which is what every
+warmup/cooldown apostrophe-format column has always been).
+
+### A block can have its own zone/percent overlay independent of other blocks on the same page
+
+The original single-main-set sample had exactly one zoned block, so
+"collect every Z-token/percent-token on the page into one flat list and
+zip it against this block's entries" happened to work. A later PDF
+(`cotes-2x6x40-`) has **two** separate zoned blocks (two "6x40\" côtes"
+series, each its own repeat group with its own single `Z5`/`95-100%` token
+pair) - the flat-zip approach required each block's entry count to equal
+the *whole page's* zone-token count, which broke as soon as there was more
+than one zoned block. Zone/percent matching is now done the same
+nearest-x0 way as everything else: each entry independently finds its own
+nearest `Z#` and percent-band token (`_nearest_payload`), so two
+(or more) independently-zoned blocks on the same page no longer interfere
+with each other.
+
+### A trailing rest only gets a pace if the block actually uses a *second* zone
+
+The original sample's "recovery before the outer repeat" rest step got a
+pace by borrowing the block's *other* zone (Z1, since the block alternates
+Z5/Z1). Several newer single-effort-zone blocks (one zone token per block,
+e.g. a `Z4`-only "500m en côtes" block, or either `Z5`-only "40\" côtes"
+series) have **no** second zone to borrow from. The original
+`zone_by_duration`-keyed fallback didn't know the difference and reused the
+effort's own zone/pace for the recovery - wrong, and caught by diffing
+against the athlete's own hand-verified expected output (every such
+recovery line has no pace at all). `_build_zone_steps` now only targets a
+rest step when a *distinct* zone is actually present somewhere else in that
+same block (`distinct` list, deduped by zone letter) - otherwise the rest is
+left untargeted, matching every sample seen so far.
+
+### VMA reference table label column position is not fixed either
+
+`_parse_pace_table` used to require the VMA-row label words to sit at
+`x0 < 90`. One PDF (`6-a-8x1000m-avec-relances`, whose longer title needs
+different centring) prints its whole table shifted right, with labels at
+`x0 ≈ 123-127` - the hardcoded threshold found zero label rows, so the
+table parsed to **empty**, and from there every pace on that entire
+workout (warm-up, main set, cool-down alike) silently came back
+`target=None` with no error anywhere. Fixed the same way the rest of this
+file's "don't hardcode a page coordinate" lesson keeps re-applying: find the
+*leftmost* VMA-shaped word on the page, then treat anything within 15pt of
+that minimum as a label. Within one PDF the label column's own horizontal
+jitter is small (4-10pt); it's only the *absolute* position that moves
+between PDFs.
+
+### A "+"-joined header can span two different entries that need different treatment
+
+One PDF (`seuil-12-8-6-3-`) prints a single centred header,
+"ÉCHAUFFEMENT + GAMMES", over what is - on the duration row - two distinct
+entries sharing one `1x` repeat marker (a 20:00 warm-up, a 5:00 drills
+block). Treating it as one combined segment would apply the warm-up's
+`role`/pace to the drills entry too (or vice versa). `_expand_combined_headers`
+splits a header on `" + "` and pairs each resulting name 1:1 with the
+block's own entries, *but only when the part-count exactly matches the
+entry-count* - this is deliberately conservative so it never fires on an
+unrelated header that happens to contain a "+" (none seen so far do; a page
+*title* containing "+" is common but titles aren't in the header band at
+all, so this never had false positives to guard against beyond the count
+check).
+
+### "Effort Cotes" cue for hill-repeat blocks
+
+The athlete's own convention: any block whose own section name mentions
+hill repeats ("côtes" - checked accent/case-insensitively via
+`_mentions_cotes`, `unicodedata`-stripped) gets `"Effort Cotes"` instead of
+a bare `"Effort"` as its cue, recovery steps unaffected (still plain
+`"Récupération"`). Cosmetic (it's the on-device block-name text, see the
+"Every block gets a device-visible name via `Step.cue`" section above), but
+worth keeping consistent since it's now the athlete's explicit labelling
+preference, not just whatever the PDF's own section name happened to say.
+
+### %VMA-band targets always render as a range, even for short efforts - confirmed, not assumed
+
+When fixing the cue text above, several of the newer hand-typed expected
+files showed a *single* pace value (e.g. "3:36/km") for short côtes efforts,
+instead of the two-sided range ("3:26-3:37/km") the original sample uses and
+that was already verified live against the API (see "Main-set targets are
+computed from %VMA directly" above). Checked whether those single values
+were a deliberate simplification (midpoint of the range, or some other
+derivable number) before assuming either way: they don't match the range's
+midpoint, any obvious alternate rounding, or anything printed anywhere else
+on those PDFs - they look like manual approximations made while hand-typing
+the expected file, not a computed value. Asked the athlete directly rather
+than guess given this changes on-device behaviour either way: confirmed the
+range format should stay, for every %VMA-band target, regardless of effort
+length. The handful of expected files with a single value for this are
+simply wrong and were not special-cased.
+
+### Hand-typed `expected.*.txt` files had several more small errors - don't chase these
+
+Cross-checked every new `expected.workout.intervals.txt` against its source
+PDF's own raw data (same technique as "Verifying against real data beats
+guessing" above) before trusting it. Found, and deliberately did *not*
+special-case the parser to reproduce:
+
+- `2026-09-22`: expected cooldown duration "15m" vs the PDF's own duration
+  row, which clearly reads `10:00` under the "RETOUR AU CALME" header.
+- `2026-09-24`: expected inter-block rest duration "3m" vs the PDF's `04:00`.
+- `2026-09-22`/`2026-09-24`/`2026-09-29`: distance-step suffix typed as
+  "mt" - not a real intervals.icu unit (see "mtr" above).
+- `2026-09-24` vs `2026-09-29` vs `2026-09-10`/`2026-09-15`: the same
+  "GAMMES ET ÉTIREMENTS"/"GAMMES" drills block is rendered three different
+  ways across the athlete's own expected files - full title-case, a
+  lowercased-and-accent-dropped "et Etirements", and truncated to just
+  "Gammes". `_display_name`'s existing title-case convention was kept
+  (matches the two oldest, presumably most-reviewed samples) rather than
+  chasing any one of the inconsistent newer variants.
+- `2026-09-29`: expected "2m30" (missing the trailing "s" that
+  `_format_duration`'s own documented "NmNs" convention always produces).
+- `2026-10-01`: expected pace "4:08/km" for the pyramid's final effort step,
+  but that column's own x0 lines up (within the usual ~10pt offset) with a
+  *different* table value, "3:59/km" - double-checked by measuring every
+  other column's offset from its own entry first (all a consistent ~10pt)
+  before concluding this one specific hand-typed value, not the extraction,
+  is what's off.
+
+None of these were special-cased into the parser logic - they were flagged
+back to the athlete instead (per this file's standing "a human-provided
+expected file is a hypothesis to check against the source data, not
+automatically ground truth" rule, established earlier in this file and
+re-confirmed repeatedly this round).

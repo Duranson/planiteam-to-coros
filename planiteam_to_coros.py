@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -61,17 +62,38 @@ _PACE_RE = re.compile(r"^(\d+)'(\d{2})/km$")
 _ZONE_RE = re.compile(r"^Z\d+$")
 _PERCENT_RANGE_RE = re.compile(r"^(\d+)-(\d+)%$")
 _VMA_LABEL_RE = re.compile(r"^\d+(?:\.\d+)?$")
+# Distance-based entries ("500m", "1.0km") instead of a mm:ss duration - seen
+# on VMA-split workouts (6x500m, 6x8x1000m...). Checked in this order so a
+# "km" token is never mis-matched by the metres pattern.
+_DISTANCE_KM_RE = re.compile(r"^(\d+(?:\.\d+)?)km$")
+_DISTANCE_M_RE = re.compile(r"^(\d+)m$")
 
 # Known line-wrap artefact in Planiteam's fixed PDF template: long section
-# titles get split across two text rows with no separating space.
+# titles get split across two text rows with no separating space. This is no
+# longer load-bearing for correctness (role detection strips whitespace and
+# substring-matches instead, see parse_planiteam_pdf) - kept only for
+# cosmetic Segment.name/JSON output on the splits it already knows about.
 _HEADER_JOIN_FIXUPS = {
     ("ÉCHAUFFEM", "ENT"): "ÉCHAUFFEMENT",
 }
+
+# Tolerance (page points) used to match a word to the nearest other word by
+# x-position - a duration/distance entry to its own "r = rest" group, to its
+# nearest Z-zone/%VMA overlay token, or to its nearest pace-table column.
+# Observed offsets across every sample PDF are 2-12pt; observed spacing
+# between two distinct real entries is never under ~48pt - so this leaves a
+# wide safety margin on both sides. See CLAUDE.md "Generalizing beyond the
+# first sample PDF".
+_X0_MATCH_TOL = 20.0
 
 
 @dataclass
 class Step:
     """One timed instruction inside a workout segment.
+
+    Exactly one of ``duration_s`` (a time, e.g. 20 seconds) or ``distance_m``
+    (a distance, e.g. 500 metres - some VMA-split workouts target a distance
+    directly rather than a time) should be set.
 
     ``cue`` is free text placed *before* the duration on the rendered line
     (e.g. "Effort 20s Z5 Pace"). Confirmed live that intervals.icu keeps this
@@ -80,12 +102,17 @@ class Step:
     shows up as that step's block name on the COROS device.
     """
 
-    duration_s: int
+    duration_s: Optional[int] = None
+    distance_m: Optional[float] = None
+    distance_unit: str = "m"
     target: Optional[str] = None
     cue: Optional[str] = None
 
     def render(self) -> str:
-        token = _format_duration(self.duration_s)
+        if self.distance_m is not None:
+            token = _format_distance(self.distance_m, self.distance_unit)
+        else:
+            token = _format_duration(self.duration_s or 0)
         # intervals.icu's structured-workout syntax requires an explicit
         # "Pace" suffix for running targets (zone or absolute pace) - a bare
         # "Z5" defaults to a *power* zone, and a bare pace value is ignored.
@@ -137,7 +164,12 @@ class Workout:
                     "repeat": segment.repeat,
                     "role": segment.role,
                     "steps": [
-                        {"duration_s": step.duration_s, "target": step.target, "cue": step.cue}
+                        {
+                            "duration_s": step.duration_s,
+                            "distance_m": step.distance_m,
+                            "target": step.target,
+                            "cue": step.cue,
+                        }
                         for step in segment.steps
                     ],
                 }
@@ -193,6 +225,22 @@ def _format_duration(total_seconds: int) -> str:
     return f"{minutes}m{seconds}s"
 
 
+def _format_distance(meters: float, unit: str) -> str:
+    """Render a distance-based step using intervals.icu's distance syntax.
+
+    Confirmed live (pushed a probe event, read back ``workout_doc``): the
+    required suffix for metres is "mtr", *not* "m" - a bare "m" means
+    *minutes* in intervals.icu's parser, so a literal "500m" step would be
+    silently reinterpreted as 500 minutes. "km" works directly (and accepts
+    a decimal, e.g. "1.0km" parses to a 1000m step). See CLAUDE.md.
+    """
+
+    if unit == "km":
+        km = meters / 1000
+        return f"{km:g}km"
+    return f"{int(round(meters))}mtr"
+
+
 def _parse_mmss(value: str) -> int:
     match = _DURATION_RE.match(value.strip())
     if not match:
@@ -232,7 +280,7 @@ _OPEN_LOWER_BOUND_FLOOR_PCT = 40
 
 
 def _vma_pace_target(lo_pct: int, hi_pct: int, vma: float) -> str:
-    """Compute an absolute pace range target for a %VMA band.
+    """Compute an absolute pace *range* target for a %VMA band.
 
     intervals.icu always pre-resolves pace *zone* targets (like "Z5 Pace")
     into an absolute pace using its own athlete-side zone config before a
@@ -241,6 +289,11 @@ def _vma_pace_target(lo_pct: int, hi_pct: int, vma: float) -> str:
     PDF actually prints and the athlete's own ``--vma``, means the main set
     no longer depends on intervals.icu's zone configuration at all - same as
     warm-up/cool-down already don't.
+
+    This always renders as a two-sided range (e.g. "3:26-3:37/km"), even for
+    short efforts - confirmed against the live API for the original sample
+    and deliberately kept consistent for every %VMA-band target rather than
+    collapsing short efforts to a single value (see CLAUDE.md).
     """
 
     speed_hi = vma * hi_pct / 100
@@ -250,6 +303,16 @@ def _vma_pace_target(lo_pct: int, hi_pct: int, vma: float) -> str:
     speed_lo = vma * lo_pct / 100
     slow_s = 3600 / speed_lo
     return f"{_format_pace_value(fast_s)}-{_format_pace_value(slow_s)}/km"
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
+def _mentions_cotes(name: str) -> bool:
+    """True if a section name refers to a hill-repeats ("côtes") block."""
+
+    return "COTE" in _strip_accents(name).upper()
 
 
 def _extract_page_words(path: Union[str, Path]) -> Tuple[List[dict], str]:
@@ -331,16 +394,51 @@ def _parse_section_headers(words: Sequence[dict]) -> List[str]:
     return [_join_header_words(sorted(g["words"], key=lambda w: (w["top"], w["x0"]))) for g in groups]
 
 
-def _pair_rest_values(rest_row: Sequence[dict]) -> List[Optional[int]]:
-    """Parse a row of ``r = <value>`` triples (value may be blank) in x-order."""
+def _expand_combined_headers(pairs: Sequence[Tuple[str, dict]]) -> List[Tuple[str, dict]]:
+    """Split a "+"-joined header over its block's entries, one-for-one.
+
+    Seen on one PDF so far: Planiteam sometimes prints a single centred
+    header like "ÉCHAUFFEMENT + GAMMES" over what is, on the duration row, two
+    distinct entries (a 20:00 warm-up and a 5:00 drills block) sharing one
+    "1x" repeat marker. Rendering that as one combined segment would wrongly
+    apply the warm-up's role/pace to the drills entry too. Splitting is only
+    attempted when the number of "+"-separated name parts exactly matches
+    the block's own entry count, so this never fires on an unrelated header
+    that happens to contain a "+" (e.g. a page title, which isn't in the
+    header band at all) - see CLAUDE.md.
+    """
+
+    expanded: List[Tuple[str, dict]] = []
+    for name, block in pairs:
+        parts = [p.strip() for p in name.split(" + ")]
+        if len(parts) > 1 and len(parts) == len(block["entries"]):
+            for part, entry in zip(parts, block["entries"]):
+                expanded.append((part, {"repeat": block["repeat"], "entries": [entry]}))
+        else:
+            expanded.append((name, block))
+    return expanded
+
+
+def _parse_rest_groups(rest_row: Sequence[dict]) -> List[dict]:
+    """Parse a row of ``r = <value>`` triples, keeping each group's own x0.
+
+    Each group is ``{"x0": float, "value_s": Optional[int], "used": False}``.
+    Groups are matched to duration/distance entries by nearest x0 (see
+    ``_parse_main_row``) rather than by flat sequential order: some PDFs
+    print an extra free-text "Consigne" annotation on the duration row that
+    carries its own (otherwise unused) "r = 0" placeholder beneath it, which
+    would desync a purely sequential pairing - see CLAUDE.md "Generalizing
+    beyond the first sample PDF".
+    """
 
     tokens = sorted(rest_row, key=lambda w: w["x0"])
-    values: List[Optional[int]] = []
+    groups: List[dict] = []
     i = 0
     while i < len(tokens):
         if tokens[i]["text"] != "r":
             i += 1
             continue
+        anchor_x0 = tokens[i]["x0"]
         i += 1
         if i < len(tokens) and tokens[i]["text"] == "=":
             i += 1
@@ -353,14 +451,34 @@ def _pair_rest_values(rest_row: Sequence[dict]) -> List[Optional[int]]:
             elif _DURATION_RE.match(text):
                 value_s = _parse_mmss(text)
                 i += 1
-        values.append(value_s)
-    return values
+        groups.append({"x0": anchor_x0, "value_s": value_s, "used": False})
+    return groups
+
+
+def _consume_nearest_rest(x0: float, rest_groups: Sequence[dict], tol: float = _X0_MATCH_TOL) -> Optional[int]:
+    best = None
+    best_dist = None
+    for group in rest_groups:
+        if group["used"]:
+            continue
+        dist = abs(group["x0"] - x0)
+        if dist <= tol and (best_dist is None or dist < best_dist):
+            best = group
+            best_dist = dist
+    if best is None:
+        return None
+    best["used"] = True
+    return best["value_s"]
 
 
 def _parse_main_row(words: Sequence[dict]) -> List[dict]:
-    """Return the ordered ``Nx ==> duration / rest`` blocks along the page.
+    """Return the ordered ``Nx ==> duration/distance / rest`` blocks on the page.
 
-    Each block is ``{"repeat": int, "entries": [(duration_s, rest_s | None), ...]}``.
+    Each block is ``{"repeat": int, "entries": [entry, ...]}`` where an
+    entry is ``{"x0": float, "duration_s": Optional[int],
+    "distance_m": Optional[float], "distance_unit": Optional[str],
+    "rest_s": Optional[int]}`` - exactly one of ``duration_s``/``distance_m``
+    is set, depending on whether this entry is a time or a distance.
 
     The two rows involved (durations, then "r = rest" below them) are found
     *relative to each other* - the "==>" row, then the nearest row above it
@@ -388,90 +506,188 @@ def _parse_main_row(words: Sequence[dict]) -> List[dict]:
         return []
     rest_row = rows[rest_row_index]
     duration_row = sorted(rows[duration_row_index], key=lambda w: w["x0"])
-    rest_values = iter(_pair_rest_values(rest_row))
+    rest_groups = _parse_rest_groups(rest_row)
 
     blocks: List[dict] = []
     current: Optional[dict] = None
     for word in duration_row:
-        repeat_match = _REPEAT_RE.match(word["text"])
+        text = word["text"]
+        repeat_match = _REPEAT_RE.match(text)
         if repeat_match:
             current = {"repeat": int(repeat_match.group(1)), "entries": []}
             blocks.append(current)
             continue
-        if current is None or not _DURATION_RE.match(word["text"]):
+        if current is None:
             continue
-        duration_s = _parse_mmss(word["text"])
-        current["entries"].append((duration_s, next(rest_values, None)))
+
+        duration_s: Optional[int] = None
+        distance_m: Optional[float] = None
+        distance_unit: Optional[str] = None
+        if _DURATION_RE.match(text):
+            duration_s = _parse_mmss(text)
+        elif _DISTANCE_KM_RE.match(text):
+            distance_m = float(_DISTANCE_KM_RE.match(text).group(1)) * 1000
+            distance_unit = "km"
+        elif _DISTANCE_M_RE.match(text):
+            distance_m = float(_DISTANCE_M_RE.match(text).group(1))
+            distance_unit = "m"
+        else:
+            # Not a duration/distance token - e.g. a "Consigne" free-text
+            # annotation Planiteam sometimes prints inline on this row (see
+            # CLAUDE.md). Skipped; its own "r = ..." placeholder (if any)
+            # simply won't be within range of any real entry.
+            continue
+
+        rest_s = _consume_nearest_rest(word["x0"], rest_groups)
+        current["entries"].append(
+            {
+                "x0": word["x0"],
+                "duration_s": duration_s,
+                "distance_m": distance_m,
+                "distance_unit": distance_unit,
+                "rest_s": rest_s,
+            }
+        )
     return blocks
 
 
-def _parse_main_set_zones(words: Sequence[dict]) -> List[str]:
-    """Zone labels (e.g. "Z5"/"Z1") overlaid above the main interval block."""
+def _parse_main_set_zones(words: Sequence[dict]) -> List[Tuple[float, str]]:
+    """Zone labels (e.g. "Z5"/"Z1") overlaid above the main interval block(s),
+    kept with their own x0 so they can be matched to the nearest entry."""
 
     zone_words = sorted((w for w in words if _ZONE_RE.match(w["text"])), key=lambda w: w["x0"])
-    return [w["text"] for w in zone_words]
+    return [(w["x0"], w["text"]) for w in zone_words]
 
 
-def _parse_main_set_zone_percents(words: Sequence[dict]) -> List[Tuple[int, int]]:
-    """The "95-100%"/"0-65%" %VMA bands overlaid alongside the zone labels."""
+def _parse_main_set_zone_percents(words: Sequence[dict]) -> List[Tuple[float, Tuple[int, int]]]:
+    """The "95-100%"/"0-65%" %VMA bands overlaid alongside the zone labels,
+    kept with their own x0 so they can be matched to the nearest entry."""
 
     percent_words = sorted((w for w in words if _PERCENT_RANGE_RE.match(w["text"])), key=lambda w: w["x0"])
-    return [tuple(int(v) for v in _PERCENT_RANGE_RE.match(w["text"]).groups()) for w in percent_words]
+    return [(w["x0"], tuple(int(v) for v in _PERCENT_RANGE_RE.match(w["text"]).groups())) for w in percent_words]
 
 
-def _parse_pace_table(words: Sequence[dict]) -> Dict[float, List[int]]:
-    """Parse the VMA reference table into ``{vma: [pace_s, pace_s, ...]}``.
+def _parse_pace_table(words: Sequence[dict]) -> Dict[float, List[Tuple[float, int, str]]]:
+    """Parse the VMA reference table into ``{vma: [(x0, seconds, kind), ...]}``.
 
-    Column count varies by PDF: some workouts only print 2 columns (a
-    warm-up and a cool-down pace); others (no %VMA zone overlay - see
-    ``parse_planiteam_pdf``) print one column per session phase instead.
-    Both are handled the same way here; it's up to the caller to decide
-    which columns mean what.
+    Column count and kind vary by PDF:
+
+    - A 2-column table (a warm-up and a cool-down pace) on most workouts.
+    - One column per session phase (warm-up, each main-set entry,
+      cool-down) on workouts with no Z-zone/%VMA overlay - see
+      ``parse_planiteam_pdf``.
+
+    ``kind`` is ``"pace"`` for an apostrophe-formatted column (e.g.
+    "7'42/km" - already a direct pace/km) or ``"raw"`` for a colon-formatted
+    column (e.g. "05:41" - the time to cover *this entry's own distance* at
+    that VMA row, not a pace/km; needs rescaling by the entry's own distance
+    before use, see ``_pace_cell_to_target``). Both kinds are seen within the
+    same table on VMA-split-distance workouts (warm-up/cool-down are
+    apostrophe, the distance entries' own split time is colon).
 
     Rows are anchored on their VMA-value label (the leftmost column, e.g.
     "17.5") rather than a fixed row-clustering tolerance: the label's exact
     vertical offset from its own pace values varies by a couple of points
     between PDFs (different fonts/rendering for a longer table), enough to
     fall outside a tight tolerance and silently drop the row.
+
+    The label column's own x0 is *not* a fixed page coordinate either - most
+    PDFs print it around x0 35-65, but one sample (a longer title needing
+    different centring) shifted the whole table right, to x0 ~123. Labels
+    are instead found as whichever VMA-shaped words sit closest to the
+    leftmost such word on the page (small spread within one PDF, e.g. 4-10pt
+    - the absolute position is what varies between PDFs). An earlier version
+    hardcoded "x0 < 90", which silently found zero rows - and from there,
+    zero pace anywhere on that workout - on that shifted PDF. See CLAUDE.md.
     """
 
     below_grid = [w for w in words if w["top"] > 150]
+    label_candidates = [w for w in below_grid if _VMA_LABEL_RE.match(w["text"])]
+    if not label_candidates:
+        return {}
+    min_label_x0 = min(w["x0"] for w in label_candidates)
     labels = sorted(
-        (w for w in below_grid if w["x0"] < 90 and _VMA_LABEL_RE.match(w["text"])),
+        (w for w in label_candidates if w["x0"] <= min_label_x0 + 15),
         key=lambda w: w["top"],
     )
 
-    table: Dict[float, List[int]] = {}
+    table: Dict[float, List[Tuple[float, int, str]]] = {}
     for label in labels:
-        paces = sorted(
-            (w for w in below_grid if abs(w["top"] - label["top"]) <= 6 and _PACE_RE.match(w["text"])),
-            key=lambda w: w["x0"],
-        )
-        if len(paces) < 2:
+        cells: List[Tuple[float, int, str]] = []
+        for w in below_grid:
+            if abs(w["top"] - label["top"]) > 6:
+                continue
+            if _PACE_RE.match(w["text"]):
+                cells.append((w["x0"], _parse_pace(w["text"]), "pace"))
+            elif _DURATION_RE.match(w["text"]):
+                cells.append((w["x0"], _parse_mmss(w["text"]), "raw"))
+        cells.sort(key=lambda c: c[0])
+        if len(cells) < 2:
             continue
-        table[float(label["text"])] = [_parse_pace(w["text"]) for w in paces]
+        table[float(label["text"])] = cells
     return table
 
 
-def _lookup_pace(table: Dict[float, List[int]], vma: float, column: int) -> Optional[int]:
-    """Look up (or linearly interpolate) the pace for a given VMA and column."""
+def _lookup_pace(table: Dict[float, List[Tuple[float, int, str]]], vma: float, column: int) -> Optional[Tuple[int, str]]:
+    """Look up (or linearly interpolate) the (seconds, kind) cell for a given VMA/column."""
 
     if not table:
         return None
+
+    def cell(v: float) -> Tuple[int, str]:
+        _, seconds, kind = table[v][column]
+        return seconds, kind
+
     if vma in table:
-        return table[vma][column]
+        return cell(vma)
 
     keys = sorted(table)
     if vma <= keys[0]:
-        return table[keys[0]][column]
+        return cell(keys[0])
     if vma >= keys[-1]:
-        return table[keys[-1]][column]
+        return cell(keys[-1])
 
     lower = max(k for k in keys if k < vma)
     upper = min(k for k in keys if k > vma)
-    lower_v, upper_v = table[lower][column], table[upper][column]
+    lower_s, kind = cell(lower)
+    upper_s, _ = cell(upper)
     ratio = (vma - lower) / (upper - lower)
-    return round(lower_v + (upper_v - lower_v) * ratio)
+    return round(lower_s + (upper_s - lower_s) * ratio), kind
+
+
+def _pace_cell_to_target(seconds: float, kind: str, distance_m: Optional[float]) -> str:
+    """Turn a looked-up pace-table cell into a "/km" target string.
+
+    A "raw" cell is the PDF's own split time for *this entry's own distance*
+    (e.g. a 1000m-repeat row), not already a pace/km - rescale it. A "pace"
+    cell is already a direct pace/km value. See ``_parse_pace_table``.
+    """
+
+    if kind == "raw" and distance_m:
+        seconds = seconds * 1000 / distance_m
+    return _format_pace(seconds)
+
+
+def _nearest_payload(x0: float, candidates: Sequence[Tuple[float, object]], tol: float = _X0_MATCH_TOL):
+    best = None
+    best_dist = None
+    for cx0, payload in candidates:
+        dist = abs(cx0 - x0)
+        if dist <= tol and (best_dist is None or dist < best_dist):
+            best = payload
+            best_dist = dist
+    return best
+
+
+def _nearest_column_index(x0: float, column_x0s: Sequence[float], tol: float = _X0_MATCH_TOL) -> Optional[int]:
+    best = None
+    best_dist = None
+    for i, cx0 in enumerate(column_x0s):
+        dist = abs(cx0 - x0)
+        if dist <= tol and (best_dist is None or dist < best_dist):
+            best = i
+            best_dist = dist
+    return best
 
 
 def _zone_number(zone: str) -> int:
@@ -479,72 +695,160 @@ def _zone_number(zone: str) -> int:
     return int(match.group()) if match else 0
 
 
-def _zone_cue(zone: str, max_zone: int) -> str:
-    # Generic effort/recovery cue, not tied to this workout's specific hill-
-    # sprint content - the highest zone number used in the block is "Effort",
-    # anything lower is "Récupération". Confirmed live that this text becomes
-    # the step's block name on the COROS device (see Step.cue docstring).
-    return "Effort" if _zone_number(zone) >= max_zone else "Récupération"
+def _zone_cue(zone: str, max_zone: int, is_cotes: bool) -> str:
+    # Generic effort/recovery cue, not tied to any one workout's content -
+    # the highest zone number used in the block is "Effort", anything lower
+    # is "Récupération". Confirmed live that this text becomes the step's
+    # block name on the COROS device (see Step.cue docstring). "Cotes" is
+    # appended to an effort cue when the block's own section name mentions
+    # hill repeats ("côtes"), per the athlete's own labelling convention.
+    if _zone_number(zone) >= max_zone:
+        return "Effort Cotes" if is_cotes else "Effort"
+    return "Récupération"
 
 
-def _alternating_cue(index: int) -> str:
-    # Used where there's no zone data to classify entries by (see
-    # ``use_per_step_pace`` in parse_planiteam_pdf) - effort/recovery is
-    # inferred purely by position instead: every workout seen so far starts
-    # with an effort and alternates from there.
-    return "Effort" if index % 2 == 0 else "Récupération"
+def _make_step(entry: dict, target: Optional[str], cue: Optional[str]) -> Step:
+    if entry["distance_m"] is not None:
+        return Step(distance_m=entry["distance_m"], distance_unit=entry["distance_unit"], target=target, cue=cue)
+    return Step(duration_s=entry["duration_s"], target=target, cue=cue)
 
 
-def _plain_block_cue(role: Optional[str], name: str) -> Optional[str]:
-    # A single-purpose block with no alternating effort/recovery structure.
-    # Warm-up/cool-down already get a correctly-localised block name on the
-    # device from the warmup/cooldown flag alone (confirmed live - see
-    # CLAUDE.md), so no extra cue is added there. Anything else (e.g.
-    # Planiteam's "GAMMES" drills) has no such flag, so its own section name
-    # becomes the cue - generic to whatever a future PDF calls that block.
-    return None if role else _display_name(name)
-
-
-def _apply_zone_targets(
-    entries: List[Tuple[int, Optional[int]]],
-    zones: List[str],
-    percents: List[Tuple[int, int]],
+def _build_role_steps(
+    entries: Sequence[dict],
+    column_x0s: Sequence[float],
+    pace_table: Dict[float, List[Tuple[float, int, str]]],
     vma: float,
 ) -> List[Step]:
-    """Turn (duration, rest) entries into Steps, targeting each at a VMA-derived pace.
-
-    The target is computed directly from the %VMA band the PDF prints (e.g.
-    "95-100%") and ``vma`` (see ``_vma_pace_target``) rather than an
-    intervals.icu zone reference like "Z5 Pace" - intervals.icu always
-    resolves those itself using its own zone config before a workout reaches
-    a device (verified at the FIT byte level, see CLAUDE.md), so computing
-    the pace here instead removes that dependency entirely. The zone letters
-    are still used, but only internally, to pick the "Effort"/"Récupération"
-    cue text.
-
-    A trailing rest value (e.g. the 3:00 recovery before the outer set
-    repeats) is treated as an extra step in whichever zone is used by the
-    *other* duration in this block (the recovery zone), since the block only
-    alternates between an effort and a recovery duration.
-    """
-
-    zone_by_duration: Dict[int, str] = {}
-    percent_by_duration: Dict[int, Tuple[int, int]] = {}
-    for (duration_s, _rest_s), zone, pct in zip(entries, zones, percents):
-        zone_by_duration.setdefault(duration_s, zone)
-        percent_by_duration.setdefault(duration_s, pct)
-    max_zone = max((_zone_number(z) for z in zones), default=0)
+    """Warm-up/cool-down steps: no cue (the role flag alone names the block
+    correctly on-device, see Segment.role), pace from the nearest pace-table
+    column to this entry's own x-position."""
 
     steps: List[Step] = []
-    for (duration_s, rest_s), zone, pct in zip(entries, zones, percents):
+    for entry in entries:
+        target = None
+        if pace_table:
+            col = _nearest_column_index(entry["x0"], column_x0s)
+            if col is not None:
+                seconds, kind = _lookup_pace(pace_table, vma, col)
+                target = _pace_cell_to_target(seconds, kind, entry["distance_m"])
+        steps.append(_make_step(entry, target=target, cue=None))
+        if entry["rest_s"]:
+            steps.append(Step(duration_s=entry["rest_s"], target=None, cue=None))
+    return steps
+
+
+def _build_zone_steps(entries: Sequence[dict], matched: Sequence[Tuple[str, Tuple[int, int]]], vma: float, is_cotes: bool) -> List[Step]:
+    """Main-set steps targeted via the Z-zone/%VMA overlay (see
+    parse_planiteam_pdf). Each entry has already been matched to its own
+    nearest zone+percent band by x-position.
+
+    A trailing rest attached to an entry (e.g. the long recovery before an
+    outer repeat, or the jog between distance reps) is targeted using
+    whichever *other* zone is used elsewhere in this same block, if any -
+    this is what the block alternates between. When the block only ever uses
+    one zone (no second zone/percent token nearby for any entry - common on
+    the single-effort-distance blocks), there is nothing to borrow from and
+    the rest is left untargeted rather than reusing the effort's own pace
+    (which would be wrong - see CLAUDE.md).
+    """
+
+    zone_numbers = [_zone_number(zone) for zone, _ in matched]
+    max_zone = max(zone_numbers)
+    distinct: List[Tuple[str, Tuple[int, int]]] = []
+    for zone, pct in matched:
+        if not any(zone == dzone for dzone, _ in distinct):
+            distinct.append((zone, pct))
+
+    steps: List[Step] = []
+    for entry, (zone, pct) in zip(entries, matched):
+        cue = _zone_cue(zone, max_zone, is_cotes)
         target = _vma_pace_target(pct[0], pct[1], vma)
-        steps.append(Step(duration_s=duration_s, target=target, cue=_zone_cue(zone, max_zone)))
-        if rest_s:
-            other = [d for d in zone_by_duration if d != duration_s]
-            rest_zone = zone_by_duration[other[0]] if other else zone
-            rest_pct = percent_by_duration[other[0]] if other else pct
-            rest_target = _vma_pace_target(rest_pct[0], rest_pct[1], vma)
-            steps.append(Step(duration_s=rest_s, target=rest_target, cue=_zone_cue(rest_zone, max_zone)))
+        steps.append(_make_step(entry, target=target, cue=cue))
+        if entry["rest_s"]:
+            alt = next((dzone_pct for dzone_pct in distinct if dzone_pct[0] != zone), None)
+            rest_target = _vma_pace_target(alt[1][0], alt[1][1], vma) if alt is not None else None
+            steps.append(Step(duration_s=entry["rest_s"], target=rest_target, cue="Récupération"))
+    return steps
+
+
+def _build_per_step_main_set_steps(
+    entries: Sequence[dict],
+    column_x0s: Sequence[float],
+    pace_table: Dict[float, List[Tuple[float, int, str]]],
+    vma: float,
+    is_cotes: bool,
+) -> List[Step]:
+    """Main-set steps targeted via a per-entry pace-table column (no zone
+    data on this PDF at all - see ``parse_planiteam_pdf``). Effort/recovery
+    is inferred purely by position (every workout seen so far starts with an
+    effort and alternates), since there's no zone data to classify by."""
+
+    steps: List[Step] = []
+    for i, entry in enumerate(entries):
+        cue = ("Effort Cotes" if is_cotes else "Effort") if i % 2 == 0 else "Récupération"
+        target = None
+        col = _nearest_column_index(entry["x0"], column_x0s)
+        if col is not None:
+            seconds, kind = _lookup_pace(pace_table, vma, col)
+            target = _pace_cell_to_target(seconds, kind, entry["distance_m"])
+        steps.append(_make_step(entry, target=target, cue=cue))
+        if entry["rest_s"]:
+            # Not observed in any per-step PDF so far (their rest values are
+            # always blank/zero, or - when present - there's no pace-table
+            # column to attribute to this extra step) - left untargeted
+            # rather than guessing.
+            steps.append(Step(duration_s=entry["rest_s"], target=None, cue="Récupération"))
+    return steps
+
+
+def _build_untargeted_main_set_steps(entries: Sequence[dict], is_cotes: bool) -> List[Step]:
+    """Fallback for a block that looks like a main set (role-less, alternating
+    or repeat+rest shaped) but has no pace source available at all - keeps
+    the Effort/Récupération cue text without inventing a target."""
+
+    steps: List[Step] = []
+    for i, entry in enumerate(entries):
+        cue = ("Effort Cotes" if is_cotes else "Effort") if i % 2 == 0 else "Récupération"
+        steps.append(_make_step(entry, target=None, cue=cue))
+        if entry["rest_s"]:
+            steps.append(Step(duration_s=entry["rest_s"], target=None, cue="Récupération"))
+    return steps
+
+
+def _build_plain_steps(
+    entries: Sequence[dict],
+    cue: Optional[str],
+    column_x0s: Sequence[float] = (),
+    pace_table: Optional[Dict[float, List[Tuple[float, int, str]]]] = None,
+    vma: float = DEFAULT_VMA,
+) -> List[Step]:
+    """A single-purpose block with no effort/recovery structure (e.g.
+    Planiteam's "GAMMES" drills, or an inter-block rest) - reuses whatever
+    the PDF itself calls the block as the cue.
+
+    Usually untargeted - except a block can legitimately sit in the "warm-up
+    .. cool-down" pace-table slot without carrying a warmup/cooldown *role*
+    (e.g. a workout that ends on a plain tempo block instead of a cool-down -
+    see CLAUDE.md). Only the table's *first or last* column is ever tried
+    here (never a middle one): a middle column can sit close enough, by sheer
+    page-layout coincidence, to an unrelated plain block (an inter-block
+    rest) to look like a match by x-position alone without actually being
+    one - the first/last slots are the only ones this template consistently
+    reserves for "a block with no explicit role".
+    """
+
+    target = None
+    if entries and column_x0s and pace_table:
+        col = _nearest_column_index(entries[0]["x0"], column_x0s)
+        if col in (0, len(column_x0s) - 1):
+            seconds, kind = _lookup_pace(pace_table, vma, col)
+            target = _pace_cell_to_target(seconds, kind, entries[0]["distance_m"])
+
+    steps: List[Step] = []
+    for entry in entries:
+        steps.append(_make_step(entry, target=target, cue=cue))
+        if entry["rest_s"]:
+            steps.append(Step(duration_s=entry["rest_s"], target=None, cue=cue))
     return steps
 
 
@@ -552,15 +856,21 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     """Parse a Planiteam PDF export into a Workout, using ``vma`` (km/h) to
     resolve step paces from the PDF's reference table.
 
-    Two different pace-table layouts have been seen from Planiteam, and this
-    dispatches between them (see CLAUDE.md for how each was found):
+    Two different pace sources have been seen from Planiteam, and this
+    dispatches between them per-block (see CLAUDE.md for how each was
+    found):
 
-    - Zone-overlay PDFs: a 2-column table (warm-up pace, cool-down pace) plus
-      a separate "Z5"/"95-100%"-style overlay for the main set, converted to
-      an absolute pace via ``_vma_pace_target``.
-    - Per-step PDFs: no zone overlay at all - instead one pace-table column
-      per session phase (warm-up, each main-set entry, cool-down), looked up
-      directly.
+    - Zone-overlay blocks: entries matched (by x-position) to a nearby
+      "Z5"/"95-100%"-style overlay, converted to an absolute pace range via
+      ``_vma_pace_target``.
+    - Per-step blocks: no zone overlay anywhere on the page - instead one
+      pace-table column per session phase (warm-up, each main-set entry,
+      cool-down), matched by x-position and looked up directly.
+
+    A block that looks like a main set (more than one entry, or a single
+    entry with an attached rest - the "effort + jog between reps" shape)
+    but has no pace source nearby falls back to an untargeted Effort/
+    Récupération rendering rather than guessing.
 
     Raises ``ValueError`` if nothing was parsed, rather than silently
     returning an empty workout - a differently-shaped PDF should fail loudly
@@ -576,59 +886,42 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     percents = _parse_main_set_zone_percents(words)
     pace_table = _parse_pace_table(words)
 
-    warmup_pace = _lookup_pace(pace_table, vma, column=0)
-    cooldown_pace = _lookup_pace(pace_table, vma, column=-1)
+    name_block_pairs = _expand_combined_headers(list(zip(section_names, blocks)))
 
-    pace_table_columns = len(next(iter(pace_table.values()), []))
-    total_flat_entries = sum(len(block["entries"]) for block in blocks)
-    use_per_step_pace = not zones and pace_table_columns > 2 and pace_table_columns == total_flat_entries
+    page_has_zone_data = bool(zones)
+    column_x0s = [x0 for x0, _, _ in next(iter(pace_table.values()))] if pace_table else []
+    use_per_step = not page_has_zone_data and len(column_x0s) > 2
 
     segments: List[Segment] = []
-    flat_index = 0
-    for name, block in zip(section_names, blocks):
-        is_zone_main_set = len(zones) > 1 and len(block["entries"]) == len(zones) == len(percents)
-        # Whitespace-insensitive: "ÉCHAUFFEMENT" wraps onto two text rows at
-        # a different character each time depending on the PDF (seen both
-        # "ÉCHAUFFEM"/"ENT" and "ÉCHAUFFEME"/"NT" splits), and
-        # _HEADER_JOIN_FIXUPS only knows the exact splits seen so far. This
-        # only matters for role detection, not display - warmup/cooldown
-        # segments never use their own name as a cue (see below), so an
-        # imperfect join here is harmless as long as the role is still found.
+    for name, block in name_block_pairs:
+        entries = block["entries"]
+        if not entries:
+            # A placeholder block - Planiteam sometimes prints a free-text
+            # "Consigne" note instead of a measurable duration/distance here
+            # (seen on two PDFs, always under a "GAMMES"-style header with no
+            # fixed duration of its own) - nothing to render. See CLAUDE.md.
+            continue
+
         name_compact = name.upper().replace(" ", "")
         role = "warmup" if "CHAUFFEMENT" in name_compact else "cooldown" if "CALME" in name_compact else None
+        is_cotes = _mentions_cotes(name)
+        is_main_set = role is None and (len(entries) > 1 or bool(entries[0]["rest_s"]))
 
-        if is_zone_main_set:
-            steps = _apply_zone_targets(block["entries"], zones, percents, vma)
-        elif use_per_step_pace:
-            # A block with more than one entry and no warmup/cooldown role
-            # is assumed to be the alternating effort/recovery main set -
-            # see _alternating_cue for why "alternating" is a safe read here.
-            is_alternating = role is None and len(block["entries"]) > 1
-            steps = []
-            for i, (duration_s, rest_s) in enumerate(block["entries"]):
-                target = _format_pace(_lookup_pace(pace_table, vma, column=flat_index))
-                flat_index += 1
-                cue = _alternating_cue(i) if is_alternating else _plain_block_cue(role, name)
-                steps.append(Step(duration_s=duration_s, target=target, cue=cue))
-                if rest_s:
-                    # Not observed in any per-step PDF so far (their rest
-                    # values are always blank) - no pace-table column to
-                    # attribute this to, so it's left untargeted rather than
-                    # guessing.
-                    steps.append(Step(duration_s=rest_s, target=None, cue=cue))
+        if role is not None:
+            steps = _build_role_steps(entries, column_x0s, pace_table, vma)
+        elif is_main_set and page_has_zone_data:
+            matched = [(_nearest_payload(e["x0"], zones), _nearest_payload(e["x0"], percents)) for e in entries]
+            if all(zone is not None and pct is not None for zone, pct in matched):
+                steps = _build_zone_steps(entries, matched, vma, is_cotes)
+            else:
+                steps = _build_untargeted_main_set_steps(entries, is_cotes)
+        elif is_main_set and use_per_step:
+            steps = _build_per_step_main_set_steps(entries, column_x0s, pace_table, vma, is_cotes)
+        elif is_main_set:
+            steps = _build_untargeted_main_set_steps(entries, is_cotes)
         else:
-            cue = _plain_block_cue(role, name)
-            steps = []
-            for duration_s, rest_s in block["entries"]:
-                if role == "warmup" and warmup_pace is not None:
-                    target = _format_pace(warmup_pace)
-                elif role == "cooldown" and cooldown_pace is not None:
-                    target = _format_pace(cooldown_pace)
-                else:
-                    target = None
-                steps.append(Step(duration_s=duration_s, target=target, cue=cue))
-                if rest_s:
-                    steps.append(Step(duration_s=rest_s, target=None, cue=cue))
+            steps = _build_plain_steps(entries, cue=_display_name(name), column_x0s=column_x0s, pace_table=pace_table, vma=vma)
+
         segments.append(Segment(name=name, repeat=block["repeat"], steps=steps, role=role))
 
     if not segments:
