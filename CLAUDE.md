@@ -101,9 +101,11 @@ exactly-100% target computed as 3:26) - the computed value is used.
   all - a flat-ground pace is meaningless on a slope, and COROS's
   grade-adjusted "Allure d'effort" can't be set via intervals.icu/FIT (the
   FIT target-type enum has no grade-adjusted variant; intervals.icu's `GAP`
-  is analysis-only). The zone goes in the cue instead: `Effort Cotes Z5`,
-  `Récupération Z1`; a rest with no zone label of its own is a bare
-  `Récupération`.
+  is analysis-only). The zone goes in the cue instead, **in parentheses**:
+  `Effort Côtes (Z5)`, `Récupération (Z1)`; a rest with no zone label of its
+  own is a bare `Récupération`. A bare `Z5` anywhere on a step line is read
+  as a power-zone target (rendered `(0-0w)` without FTP, which crashed the
+  COROS app).
 - **Plain single-entry blocks** (drills, an inter-block jog, a tempo): cue =
   header name, title-cased (`Gammes`, `Récup Footing Avant Tempo`); a target
   only when its own pace column says effort (e.g. an 80% tempo).

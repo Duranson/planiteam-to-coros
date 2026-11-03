@@ -60,7 +60,7 @@ class ParsingTest(unittest.TestCase):
         # The trailing 3:00 rest has no zone label of its own.
         self.assertEqual(
             [s.cue for s in main_set.steps],
-            ["Effort Cotes Z5", "Récupération Z1"] * 5 + ["Effort Cotes Z5", "Récupération"],
+            ["Effort Côtes (Z5)", "Récupération (Z1)"] * 5 + ["Effort Côtes (Z5)", "Récupération"],
         )
         self.assertTrue(all(s.pace_pct is None for s in main_set.steps))
 

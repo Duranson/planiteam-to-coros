@@ -2,11 +2,11 @@ Warmup
 - 20m
 
 3x
-- Effort Cotes Z5 2m
+- Effort Côtes (Z5) 2m
 - Récupération 1m15s
-- Effort Cotes Z5 1m30s
+- Effort Côtes (Z5) 1m30s
 - Récupération 1m
-- Effort Cotes Z5 1m
+- Effort Côtes (Z5) 1m
 - Récupération 2m
 
 Cooldown

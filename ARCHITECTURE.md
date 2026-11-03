@@ -50,8 +50,8 @@ flowchart TD
     INT --> INTENSITY["intensity = nearest Z# label +\nnearest %VMA band, else nearest pace column's %VMA"]
     INTENSITY --> KIND{"recovery?\nZ<=2, else %VMA < 70"}
     KIND -- "unknown" --> ERR["ValueError"]
-    KIND -- recovery --> REC["'Récupération' [Zn on côtes]\nno target"]
-    KIND -- effort --> EFF["'Effort' / 'Effort Cotes Zn'\ntarget = %VMA (none on côtes)"]
+    KIND -- recovery --> REC["'Récupération' [(Zn) on côtes]\nno target"]
+    KIND -- effort --> EFF["'Effort' / 'Effort Côtes (Zn)'\ntarget = %VMA (none on côtes)"]
 ```
 
 An attached `r = rest` always becomes an extra untargeted `Récupération` step.

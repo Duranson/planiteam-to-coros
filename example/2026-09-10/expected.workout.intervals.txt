@@ -4,17 +4,17 @@ Warmup
 - Gammes 10m
 
 2x
-- Effort Cotes Z5 20s
-- Récupération Z1 40s
-- Effort Cotes Z5 20s
-- Récupération Z1 40s
-- Effort Cotes Z5 20s
-- Récupération Z1 40s
-- Effort Cotes Z5 20s
-- Récupération Z1 40s
-- Effort Cotes Z5 20s
-- Récupération Z1 40s
-- Effort Cotes Z5 20s
+- Effort Côtes (Z5) 20s
+- Récupération (Z1) 40s
+- Effort Côtes (Z5) 20s
+- Récupération (Z1) 40s
+- Effort Côtes (Z5) 20s
+- Récupération (Z1) 40s
+- Effort Côtes (Z5) 20s
+- Récupération (Z1) 40s
+- Effort Côtes (Z5) 20s
+- Récupération (Z1) 40s
+- Effort Côtes (Z5) 20s
 - Récupération 3m
 
 Cooldown

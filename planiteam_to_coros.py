@@ -481,9 +481,11 @@ def _interval_steps(block: _Block, entries: Sequence[_Entry], page: _Page) -> Li
         recovery = _is_recovery(zone, band)
         if recovery is None:
             raise ValueError(f"{block.name}: no zone label or pace column next to the step at x={entry.x0:.0f}")
-        cue = RECOVERY_CUE if recovery else "Effort Cotes" if is_cotes else "Effort"
+        cue = RECOVERY_CUE if recovery else "Effort Côtes" if is_cotes else "Effort"
         if is_cotes and zone is not None:
-            cue += f" Z{zone}"
+            # Parenthesised: a bare "Z4" on the line is read by intervals.icu
+            # as a *power* zone target, which shows as "(0-0w)" and crashes COROS.
+            cue += f" (Z{zone})"
         steps.append(_step(entry, cue=cue, pace_pct=None if recovery or is_cotes else band))
         if entry.rest_s:
             steps.append(Step(duration_s=entry.rest_s, cue=RECOVERY_CUE))
