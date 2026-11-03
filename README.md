@@ -25,11 +25,12 @@ Planiteam (coach creates a session)
 
 The PDF has no field for the athlete's actual VMA (only a reference table
 for a range of VMA values), so it's passed in as a parameter and used to
-compute real paces - warm-up/cool-down get an absolute pace from the PDF's
-own table, and the main set's effort/recovery targets are computed directly
-from the %VMA the PDF prints, rather than relying on intervals.icu's own
-pace-zone configuration (which would otherwise have to be kept in sync with
-whatever COROS estimates on its own - see CLAUDE.md for why that matters).
+compute real paces: every effort target is a %VMA read from the PDF (its
+zone overlay or its pace-table column) turned into an absolute pace, rather
+than relying on intervals.icu's own pace-zone configuration (which would
+otherwise have to be kept in sync with whatever COROS estimates on its own -
+see CLAUDE.md for why that matters). Warm-ups, cool-downs, recoveries and
+hill repeats get no pace target on purpose.
 
 ## Quick start
 
@@ -41,25 +42,18 @@ python planiteam_to_coros.py path/to/session.pdf --vma 17.5
 That prints the parsed workout as intervals.icu structured-workout text.
 Useful flags:
 
-- `--format json` - dump the parsed workout as JSON instead.
 - `--output FILE` - write to a file instead of stdout.
 - `--vma FLOAT` - your VMA in km/h (default `17.5`, tuned to this repo's
   owner - override it).
-- `--push --date YYYY-MM-DD` - also push the workout to intervals.icu as a
-  planned event on that date (the PDF has no session date, only the
-  notification email does).
-- `--sport` - intervals.icu sport type for a pushed event (default `Run`).
+- `--push-recipients --date YYYY-MM-DD` - push the workout as a planned
+  event on that date (the PDF has no session date, only the notification
+  email does) to every enabled recipient, each with their own VMA - the same
+  thing the Cloud Function does.
 
-Pushing requires two credentials, read from environment variables (or a
-local `.env` file, auto-loaded, **never commit this file**):
-
-```
-INTERVALS_ICU_API_KEY=...
-INTERVALS_ICU_ATHLETE_ID=...
-```
-
-Both are available from your intervals.icu account under Settings ->
-Developer Settings.
+Recipients are read from `RECIPIENTS_JSON` (env var or a local `.env` line)
+or a local `recipients.json` (**never commit either**) - see "Build your
+recipients list" in [DEPLOYMENT.md](DEPLOYMENT.md). Each entry needs an
+intervals.icu API key and athlete id, from Settings -> Developer Settings.
 
 ## Automatic sync from a Gmail notification
 
@@ -84,7 +78,9 @@ the rest of the club.
 
 | Path | What |
 |---|---|
-| `planiteam_to_coros.py` | The parser and intervals.icu client - the core of this repo. |
+| `planiteam_to_coros.py` | The PDF parser and the CLI - the core of this repo. |
+| `intervals_icu.py` | intervals.icu client: recipients list and event push. |
+| `ARCHITECTURE.md` | Map of the parsing pipeline. |
 | `main.py` | Cloud Function entry point for the Gmail automation. |
 | `manage_recipients.py` | Publishes `recipients.json` to the `RECIPIENTS_JSON` Secret Manager secret. |
 | `apps_script/Code.gs` | The Gmail-watching side of that automation. |
@@ -95,14 +91,11 @@ the rest of the club.
 
 ## Limitations
 
-This was built and tested against one specific Planiteam PDF template
-(interval-style running sessions with a warm-up, drills, a repeated
-effort/recovery block, and a cool-down). A differently-shaped session -
-a continuous tempo run, a session with more than two intensity zones,
-swimming or cycling - will likely need the parser extended; it's written to
-fail loudly (an exception, or a mismatched structure) rather than silently
-produce a wrong workout, but it hasn't been validated against anything but
-the sample in `example/`.
+This was built and tested against the Planiteam PDFs in `example/`
+(running sessions: warm-up, drills, repeated effort/recovery blocks by time
+or distance, hill repeats, pyramids, cool-down). A differently-shaped
+session will likely need the parser extended; it's written to fail loudly
+(a `ValueError`) rather than silently produce a wrong workout.
 
 VMA-based pace computation is specific to how *this* Planiteam account's
 sessions are set up. If your coach expresses intensity differently (HR

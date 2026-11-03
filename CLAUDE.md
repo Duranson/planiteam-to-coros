@@ -2,948 +2,194 @@
 
 Converts a Planiteam workout PDF export into an intervals.icu planned
 calendar event (pushed via the intervals.icu API), which intervals.icu then
-syncs to a COROS watch — that device sync is configured on intervals.icu's
+syncs to a COROS watch - that device sync is configured on intervals.icu's
 website, out of scope for this repo.
 
-There is no Planiteam API; PDF export is the only available data source, and
-it is a genuinely awkward one. The first half of this file documents what was
-reverse-engineered about its structure. The second half documents the
-intervals.icu push side, which turned out to have its own non-obvious traps —
-**verified live against a real account**, not just read from docs (see
-"Verify against the live API, not just the docs" below for why that mattered).
-
-## The PDF is not a text document, it's a coordinate dump
-
-Planiteam's PDF places section titles, the interval grid, and a pace
-reference table as independently-positioned text objects. A naive linear text
-extraction (`pypdf.extract_text()`, or `pdfplumber`'s own `.extract_text()`)
-interleaves unrelated rows into garbage. **Always parse via word positions**
-(`page.extract_words()` in `pdfplumber`, which gives `x0/x1/top` per word),
-never via the flattened text string. `planiteam_to_coros.py` does this
-throughout; `Workout.source_text` keeps the flattened text only for
-debugging/JSON dumps, it is never parsed.
-
-Reference example: `example/2026-09-10/cotes-courtes-2x6x20-.pdf`, matching
-the screenshot the user provided when this was built (a "Côtes courtes :
-2x6x20"" session — 20' warm-up, 10' drills, 2×[6×(20s effort/40s jog) with a
-3' recovery before the second set], 10' cool-down, total 56:40). Two more
-real PDFs arrived later with structurally different layouts
-(`example/2026-09-15/`, `example/2026-09-17/`) - see "Generalizing beyond
-the first sample PDF" near the end of this file for what they broke and how.
-Each `example/<date>/` folder is named after the session's actual date (from
-the notification email, not the PDF - it has no date field, see below).
-
-## Layout of the page (single page, fixed template)
-
-| Region | `top` range | Content |
-|---|---|---|
-| Title | ≤ 60 | `TITLE ... Édité le DD/MM/YYYY` — title words are left-aligned (small x0), the edit-date is far right (x0 > 700). No separating token; split by scanning until the word `"Édité"`. **The scheduled workout date is not in the PDF at all** — only the PDF's *export* date. |
-| Section headers | ~95–120 | e.g. `ÉCHAUFFEMENT`, `GAMMES`, `2X6X20" CÔTES`, `RETOUR AU CALME` |
-| Interval grid, duration row | ~128–136 | `1x`, `20:00`, `1x`, `10:00`, `2x`, `00:20`, `00:40`, ... |
-| Interval grid, rest row | ~140–150 | `r = 0`, `r = `, `r = 3:00`, one under each duration cell |
-| Zone-label overlay | coincides with pace-table rows 18/18.5 | `Z5 Z1 Z5 Z1 ...` and `95-100% 0-65% ...` |
-| VMA pace reference table | > 150 | rows for VMA 12 → 23, two pace columns |
-| Footer | far bottom | `© PlaniTeam` |
-
-### Section headers vs. interval blocks: match by order, not by x-position
-
-Headers are **centered** over their block, not left-aligned to it, so you
-cannot line up a header's x0 with a block's x0. What *does* work: the number
-of section headers always equals the number of `Nx ==>` blocks on the
-interval row, and both are read left-to-right — zip them by index.
-
-Headers can also wrap onto a second physical text row with **no space** at
-the join, purely because the label is long (`ÉCHAUFFEM` / `ENT` →
-`ÉCHAUFFEMENT`). Reconstructing this generically (word-wrap vs. two separate
-words needing a space, e.g. `RETOUR`/`AU`/`CALME`) isn't reliably decidable
-from position alone since the whole template is upper-case. Current approach:
-cluster header words by horizontal proximity across rows (regardless of
-y-position) to group multi-row headers, then join with spaces, with one
-hardcoded fixup for the known no-space wrap (`_HEADER_JOIN_FIXUPS` in
-`planiteam_to_coros.py`). If a new PDF has a different long header that wraps
-mid-word, add its fixup there.
-
-### Interval grid semantics
-
-Each block is `Nx ==> duration₁ (r = rest₁) duration₂ (r = rest₂) ...`.
-`rest` is the *additional* pause after that specific duration, before the
-next one — usually `0` or blank (blank specifically appears after **effort**
-durations, since the very next duration token, the recovery, already covers
-that gap). The one meaningful non-zero `r` value in the sample
-(`r = 3:00` after the 6th and last `00:20`) is the recovery **before the
-outer `Nx` repeats**, not a 7th interval.
-
-So: a block with a repeat count > 1 and alternating durations models a
-"repeat this whole sequence N times" structure; the trailing non-zero rest on
-the last entry becomes an extra step, tagged with whichever zone the *other*
-duration value uses (see `_apply_zone_targets`) since the block only
-alternates between one effort zone and one recovery zone.
-
-Verification that this reconstruction is right: summing all step durations ×
-repeat counts across the whole workout reproduces the exact total (`56:40`)
-that Planiteam's own UI displays for this session. This is the cheapest
-sanity check to rerun on any new sample PDF.
-
-### Zone-label overlay row is a coincidence, not a real table row
-
-The `Z5 Z1 Z5 Z1 ...` and `95-100% 0-65% ...` tokens are printed at the same
-`top` as pace-table rows for VMA 18 and 18.5 purely because that's where they
-land vertically on the page — they are **not** data about VMA 18. They are
-metadata for the interval grid above (11 tokens, one per duration entry in
-the main set: 6× `Z5` for the 6 efforts, 5× `Z1` for the 5 short recoveries).
-Match them to the main block's entries by x-order / count, not by which pace
-row they visually overlap. `_ZONE_RE` (`^Z\d+$`) finds these anywhere on the
-page — filtering by regex is what keeps them from being mis-parsed as pace
-table content.
-
-### VMA pace reference table: what the two columns actually mean
-
-Rows are the standard French "VMA test" reference speeds (12.0 → 23.0 km/h,
-half-steps in the upper range), **not** the athlete's own VMA. Each row has
-two pace columns. This was reverse-engineered empirically, not documented
-anywhere:
-
-- col1 (left, x0 ≈ 85) = pace at **60% of that row's VMA**
-  (`pace_min_per_km = 100 / vma_row`)
-- col2 (right, x0 ≈ 771) = pace at **55% of that row's VMA**
-  (`pace_min_per_km ≈ 109.1 / vma_row`)
-
-The way this was confirmed: the screenshot's warm-up pace (`5:43/km`) and
-cool-down pace (`6:14/km`) exactly match row **17.5**'s col1 and col2. So:
-**col1 is the warm-up pace, col2 is the cool-down pace, for the row matching
-the athlete's own VMA.** The athlete's actual VMA is a personal setting that
-does **not** appear anywhere in the PDF — it must be supplied externally
-(`--vma`, default `17.5`, the repo owner's value — see `DEFAULT_VMA` in
-`planiteam_to_coros.py`).
-
-The main set's effort/recovery zones use the `Z5`/`Z1` labels directly
-instead of being converted through this table (see below) — those two
-columns are only used for the non-interval (warm-up/cool-down) blocks,
-matched by section name containing `"CHAUFFEMENT"` or `"CALME"`.
-
-Unresolved/unverified: what the 60%/55% figures actually correspond to
-semantically (e.g. "EF" pace, "Récup" pace) — the screenshot's own badges say
-`EF 40%` and `Récup 55%`, which only half-matches (55% does, 40% doesn't).
-Those badge percentages are plausibly %HRmax rather than %VMA, i.e. a
-different axis entirely. This was left unresolved since the *numeric pace
-values* are independently verified correct (they match the screenshot's own
-computed output), regardless of what the "40%"/"55%" badges mean.
-
-### Why Z5/Z1 are kept as literal intervals.icu zone tokens
-
-The PDF's main-set zone labels (`Z5`, `Z1`) are reused verbatim as
-intervals.icu zone shorthand rather than converted to explicit VMA-derived
-paces. This assumes the athlete's intervals.icu pace-zone configuration
-roughly matches Planiteam's zone numbering (Z5 ≈ 95-100% VMA effort, Z1 ≈
-0-65% VMA recovery). This is an assumption, not verified against the user's
-actual intervals.icu zone config — flag it if a converted session looks
-wrong on intervals.icu/COROS, and convert to computed pace ranges instead
-(`vma × %` bounds are easy to derive from the same `--vma` value already
-being plumbed through).
-
-## The "mojibake" that isn't
-
-Printing extracted text to a Windows terminal shows accented characters
-(É, Ô, é...) as `�`. **This is a terminal/console-encoding display artifact,
-not corrupted data** — `sys.stdout.encoding` in this environment is `cp1252`
-and the console can't render the actual glyph, but the underlying Python
-string holds the correct Unicode codepoint (verified: `ord(char)` gives the
-right value, e.g. `0xD4` = `Ô`, and round-tripping through a UTF-8 file and
-reading it back with `encoding="utf-8"` preserves it correctly). Don't chase
-this as a bug — just make sure output is always written with
-`encoding="utf-8"` (already done throughout `planiteam_to_coros.py`), and use
-a file round-trip rather than `print()` if you need to eyeball extracted
-accented text while debugging in this shell.
-
-## Practical notes for extending the parser
-
-- `pdfplumber` was chosen over `pypdf` specifically for `extract_words()`'s
-  positional data; don't regress back to plain text extraction.
-- The whole page-region `top` bands above (title/headers/grid/rest/table)
-  are specific to this one fixed PDF template. If a differently-shaped
-  Planiteam workout (e.g. more/fewer sections, no repeat block, multiple
-  interval blocks) is supplied, re-derive the bands the same way this file
-  describes: dump `page.extract_words()` sorted by `(top, x0)` and look for
-  the same structural landmarks (`==>`, `r =`, `Nx`, `Z\d`, `\d+'\d{2}/km`).
-- Cross-check any new sample against its app screenshot the same way this one
-  was: total duration must match the UI's stated duration, and any pace
-  shown in the UI should match a value derivable from the parsed data. Don't
-  trust a structurally-plausible parse without this numeric cross-check —
-  it's what caught that the original hardcoded draft was wrong.
-- If a new PDF's date field is needed, `Workout.date` is currently always
-  `None` — the PDF only has an "edited on" date, not the scheduled session
-  date, and there is nowhere else in this repo's inputs to source it from
-  (would need to come from a CLI flag or Planiteam calendar export instead).
-- Dropping a new PDF + a hand-checked `expected.workout.intervals.txt` into
-  its own `example/<date>/` folder is enough to get a test for it — no code
-  change needed. `tests/test_examples.py` discovers every `example/*/`
-  folder at import time and attaches one dynamically-named test method per
-  folder (`test_2026_09_10`, ...), individually runnable from VSCode's
-  Testing tab (wired up via `.vscode/settings.json`, `unittest` discovery —
-  not pytest, to avoid a new dependency). Each run always writes that
-  folder's rendered output to `actual.workout.intervals.txt` (gitignored)
-  next to the PDF, pass or fail, so a mismatch can be diffed directly
-  against `expected.workout.intervals.txt` in the editor instead of reading
-  it out of a test failure message.
-
-## Pushing to intervals.icu
-
-`push_event()` / `build_event_payload()` create a planned calendar event via
-`POST /api/v1/athlete/{id}/events` (`--push --date YYYY-MM-DD` on the CLI).
-Credentials come from `INTERVALS_ICU_API_KEY` / `INTERVALS_ICU_ATHLETE_ID`
-(env vars, auto-loaded from a gitignored `.env` via `python-dotenv`) — get
-them from `https://intervals.icu/settings` → Developer Settings.
-
-### Verify against the live API, not just the docs
-
-The schema was pulled from the real OpenAPI spec at `https://intervals.icu/api/v1/docs`
-(fetch it with `curl`, not `WebFetch` — the tool's summarizing pass truncates
-a spec this large; `curl -s .../api/v1/docs -o spec.json` then `json.load`
-and index into it directly). That confirmed the endpoint, field names, and
-auth scheme (HTTP Basic, username literally `API_KEY`, password = the API
-key) — see `INTERVALS_ICU_BASE_URL`/`push_event` in `planiteam_to_coros.py`.
-
-That was necessary but **not sufficient**. The schema tells you a field is
-accepted; it doesn't tell you the request will be understood the way you
-expect. The first live push here returned `200 OK` with no `push_errors`,
-and still silently produced a wrong workout — nearly a full missed repeat
-and every zone mapped to the wrong axis (power instead of pace). **A
-successful-looking response is not confirmation the workout was parsed as
-intended** — always `GET` the event back afterwards and inspect
-`workout_doc` (the server's own parse of your `description` text) and
-`moving_time` (cross-check it against the total you computed locally, the
-same way the PDF parsing itself was verified). Don't trust the request that
-sent the data; trust the one that reads back what the server actually stored.
-
-Two traps this caught, both invisible from the API schema alone (the schema
-only says `description` is a `string` — the actual grammar of that string is
-undocumented in the OpenAPI spec and lives only in intervals.icu's forum:
-https://forum.intervals.icu/t/workout-builder-syntax-quick-guide/123701):
-
-- **Repeat blocks**: the header line is a *bare* `2x` (no leading `- `), and
-  its child steps are plain `- ` bullets at the **same** indentation as
-  everything else (not nested/indented under the `2x` line). The forum guide
-  also asks for a blank line before and after each repeat block. Getting this
-  wrong doesn't error — intervals.icu just silently treats the whole thing as
-  flat, unrepeated steps, so a "2x(...)" block quietly executes once instead
-  of twice. `Workout.to_intervals_icu_text()` joins every top-level segment
-  with a blank line (`"\n\n".join(...)`), which satisfies the blank-line
-  convention as a side effect.
-- **Pace/zone targets need an explicit `Pace` suffix.** A bare zone like
-  `Z5` defaults to a **power** zone (bike-oriented default, wrong for a
-  running workout) unless written `Z5 Pace`. A bare absolute pace like
-  `5:43/km` is **silently dropped** (not an error, just absent from the
-  parsed `workout_doc`) unless written `5:43/km Pace`. `Step.render()` always
-  appends `" Pace"` after a non-empty target for this reason — if this repo
-  ever needs a non-running sport, that suffix needs to become conditional.
-
-### `uid`/`upsertOnUid` does not provide idempotent re-push
-
-An earlier version of this code tried to make repeated pushes idempotent by
-sending a deterministic client-generated `uid` (from title+date) with
-`upsertOnUid=true`, expecting a second push for the same session to update
-the first event instead of duplicating it. **This does not work**: verified
-live that intervals.icu ignores any client-supplied `uid` on creation and
-always assigns its own server-generated UUID — so a client-side "the uid
-should already match" strategy can never find anything to update, since
-nothing with that uid was ever actually stored. This was caught by pushing
-twice and diffing the event IDs (got two different ones), then confirming
-via `GET` that the stored `uid` field didn't match what was sent.
-
-Current behavior (deliberately simple, matching what the API actually does):
-every `push_event()` call creates a **new** event; `upsertOnUid` is always
-sent as `false`. Re-running `--push` for the same PDF/date will duplicate the
-event — clean up stray ones by hand, or `DELETE
-/api/v1/athlete/{id}/events/{eventId}`. If real idempotency is wanted later,
-it would need the *server-returned* `id`/`uid` cached locally after a
-successful push (e.g. a sidecar file keyed by PDF+date) and reused as a `PUT`
-target on the next run — this was consciously not built since nobody asked
-for it yet and it adds real state-management complexity.
-
-### Getting a step recognised as Warmup/Cooldown on the device
-
-intervals.icu's structured-workout text supports a bare `Warmup` or
-`Cooldown` line as a section header immediately before a block. This is not
-just a readability label — **confirmed live** (push a probe event, `GET` it
-back, inspect `workout_doc.steps`) that it is the only thing that makes
-intervals.icu tag that step `"warmup": true` / `"cooldown": true` in
-`workout_doc`, which is what should let it sync to the watch as the correct
-step type instead of a generic interval/active step. A step with no such
-header, or headed by anything else (including the *French* label Planiteam
-itself uses, `ÉCHAUFFEMENT` — tested, does **not** work), gets no such flag.
-It must be the literal English keyword.
-
-This is implemented as `Segment.role` (`"warmup"` / `"cooldown"` / `None`),
-set once in `parse_planiteam_pdf` from the same name-matching already used
-for pace lookup, then consumed by `to_intervals_icu_text()` to prepend the
-keyword line. If a new PDF template uses different section names, the
-matching there (`"CHAUFFEMENT" in name.upper()` / `"CALME" in name.upper()`)
-is the place to extend.
-
-Confirmed on a real watch: after pushing a corrected event, the user saw it
-auto-sync into the COROS app's Training Calendar with the warm-up/cool-down
-correctly typed. So this mechanism is verified end-to-end, not just on
-intervals.icu's side.
-
-### There is no equivalent keyword for "Recovery" steps inside a repeat
-
-Tried to get the main set's `Z1` jog steps tagged the same way (COROS calls
-this step type "Récupération"). **Exhaustively tested and it doesn't exist**
-— four live probes, all confirmed via `GET`+`workout_doc` inspection, then
-cleaned up (events deleted):
-
-1. `Recovery`/`Interval` as a **leading word on the same line** as a step
-   (`- Recovery 40s Z1 Pace`): parsed, but only becomes a free-text `"text"`
-   cue on that step (e.g. `{"text": "Recovery", "pace": {...}, "duration": 40}`)
-   — a label, not a structured type flag. No `"recovery": true` equivalent
-   appears anywhere.
-2. `Recovery` as its **own header line between the two child steps inside a
-   repeat** (mirroring how `Warmup`/`Cooldown` work): silently dropped
-   entirely — doesn't even survive as a text cue, the step comes back with
-   no trace of it.
-3. `Recovery` as a **standalone top-level segment header** (same shape as
-   the working `Warmup`/`Cooldown` test, just not nested in a repeat):
-   also dropped entirely, same as `Rest`.
-4. `Rest` as a standalone top-level header: same result as `Recovery` — dropped.
-
-Conclusion: **`Warmup` and `Cooldown` are the only two special step-type
-keywords intervals.icu's text format recognises.** There's no text-syntax
-equivalent for `Recovery`/`Rest`/`Active`/`Interval` — those FIT-style step
-types (if COROS's own display logic distinguishes them at all) are most
-likely inferred device-side from the step's pace/power **zone number**
-itself (e.g. zone 1 conventionally means "easy/recovery" across most
-platforms' zone models), not from anything intervals.icu's API exposes as a
-settable field. This repo doesn't control that — the main set's `Z1 Pace`
-target is already the most it can do; if COROS shows "Récupération" for
-those steps, it's reading that from the low zone number, not from a flag
-this code could set differently.
-
-The one real (if partial) lever available: option 1 above (`Recovery` as
-leading same-line text) genuinely works as a text cue. **This is now wired
-up** (see next section) — it doesn't change the step's *type*, but it does
-become the step's displayed block name on the device, which is what was
-actually being asked for.
-
-### Every block gets a device-visible name via `Step.cue`
-
-`Step.cue` is free text rendered before the duration on a step's line (e.g.
-`Effort 20s Z5 Pace`). Confirmed live (push, `GET`, inspect `workout_doc`)
-that it lands as that step's `"text"` field, and confirmed by the user on a
-real device that this is what shows as the block's name in the COROS app
-(their app showed unlabeled numbered blocks for every step without one -
-`Warmup`/`Cooldown` were already named correctly via the role flag, but the
-drills block and every individual interval/recovery step were just numbers).
-
-Rules implemented in `parse_planiteam_pdf`/`_apply_zone_targets` (kept
-deliberately generic - not specific to hill-sprint workouts, since any
-Planiteam PDF this parses could be a different session shape):
-
-- Warm-up/cool-down: **no cue** - the `warmup`/`cooldown` flag alone already
-  produces a correctly-localised device label (confirmed: shows as
-  "Echauffement"/"Retour au calme" in French even though the flag is set via
-  the literal English keyword - COROS localises the *flag*, not any text we
-  send). Adding a redundant cue here was deliberately not attempted; it's
-  unverified whether a cue would coexist with the flag's label or clobber it,
-  and there was no reason to risk the thing that already works correctly.
-- Any other single-step block (e.g. Planiteam's "GAMMES" drills, `role is
-  None` and not the main interval set): cue = that segment's own section
-  name, title-cased (`_display_name`) - e.g. `GAMMES` → `Gammes`. This reuses
-  whatever the PDF itself calls the block rather than hardcoding a label, so
-  it stays meaningful for a differently-shaped workout.
-- Main-set steps (the `Z5`/`Z1`-style alternating block): cue = `"Effort"` for
-  whichever zone number is highest in that block, `"Récupération"` for any
-  lower zone (`_zone_cue`/`_zone_number`). This is a **binary** effort-vs-
-  recovery heuristic - fine for the simple two-zone alternating pattern seen
-  so far, but would mislabel a block with more than two distinct zones (e.g.
-  a three-step pyramid) since everything below the single highest zone would
-  be called "Récupération" even if it's still a moderately hard effort. No
-  such PDF has been seen yet to design against; revisit if one shows up.
-  (Note: the zone *letters* `Z5`/`Z1` are still parsed and still drive this
-  cue internally - they're just never sent to intervals.icu as a target any
-  more, see next section.)
-
-### Main-set targets are computed from %VMA directly, not sent as intervals.icu zones
-
-Originally the main set's targets were `Z5 Pace`/`Z1 Pace` (an intervals.icu
-zone reference). Asked whether that could stay a *reference* all the way to
-the watch, so the watch's own threshold-pace estimate decides the actual
-pace - avoiding keeping intervals.icu's `threshold_pace` manually in sync
-with whatever COROS estimates on its own. Checked at the actual byte level
-rather than guessed: **it can't, so this was changed instead.**
-
-FIT's `workout_step` message *does* have a mechanism for a device-resolved
-target: a `target_speed_zone` field that (per the Garmin FIT SDK convention,
-same idea as `target_hr_zone` for heart rate) can hold a small zone-index
-integer and leave the device to resolve it against its own configured zones,
-instead of a pre-computed range. intervals.icu just never uses it. Downloaded
-the actual `.fit` export intervals.icu hands to a device
-(`GET /api/v1/athlete/{id}/events/{eventId}/download.fit`, parsed with the
-`fitdecode` package — a one-off diagnostic, not added to `requirements.txt`)
-for the `Z5`/`Z1`-targeted version of this workout and inspected every
-`workout_step`:
-
-```
-target_type: 'speed', target_speed_zone: 0,
-custom_target_speed_low: 3.802, custom_target_speed_high: 3.932   # Effort (Z5)
-target_type: 'speed', target_speed_zone: 0,
-custom_target_speed_low: 2.357, custom_target_speed_high: 2.947   # Récupération (Z1)
-```
-
-`target_speed_zone` was `0` (unused) on **every single step**, including the
-ones written as bare `Z5 Pace`/`Z1 Pace`. intervals.icu always resolves a
-pace zone into an absolute `custom_target_speed_low/high` range (m/s)
-server-side, using the athlete's *own intervals.icu* pace-zone configuration,
-before it ever reaches the FIT file. This also explained the earlier
-`null-null` symptom cleanly: there was nothing downstream to fall back to
-when `threshold_pace` was unset — resolution happens once, here, or not at
-all. So the double source of truth (COROS's own pace estimate vs.
-intervals.icu's `threshold_pace`) would be unavoidable for as long as pace
-*zones* are what gets sent for the main set - no config flag or alternate
-text syntax defers that resolution to the device.
-
-**Fix implemented**: `_vma_pace_target` (called from `_apply_zone_targets`,
-using the %VMA bands parsed by `_parse_main_set_zone_percents` - the
-"95-100%"/"0-65%" text overlaid next to the `Z5`/`Z1` labels, see the zone-
-label-overlay section above) computes an absolute pace directly from the
-PDF's own %VMA figures and `--vma`, the same way `_lookup_pace` already did
-for warm-up/cool-down. E.g. for VMA 17.5: `95-100%` → `3:26-3:37/km`,
-`0-65%` → `5:16/km` (a single value, not a range - see below). Verified this
-target syntax works the same way as the earlier syntax fixes: pushed a probe
-with `20s 3:26-3:37/km Pace`, `GET` it back, confirmed
-`workout_doc` shows `{"pace": {"units": "secs/km", "start": 206, "end": 217}}`
-- a real absolute range, no `pace_zone` unit anywhere. Then re-pushed the
-real event and confirmed the same on it (`moving_time` still 3400, correct
-`secs/km` values on every step).
-
-This does **not** eliminate a second number to maintain - the athlete's VMA
-in `--vma` still needs updating by hand occasionally - but it does eliminate
-intervals.icu's zone config specifically as a dependency: the main set no
-longer cares whether `threshold_pace` is set at all, same as warm-up/
-cool-down already didn't.
-
-**0% lower bound**: a %VMA band's lower bound of 0 (the actual PDF value for
-the recovery zone, `0-65%`) has no finite pace - 0% VMA is a dead stop, and
-means "go as slow as you like." The first attempt collapsed that case to a
-single pace value (just the band's faster/upper-% edge, e.g. `5:16/km` for
-`0-65%`) instead of an undefined open range. **That backfired in practice**:
-confirmed on the real watch that COROS renders a bare single-value pace
-target with its own tight auto-generated tolerance band - the user saw
-`5:16/km` show up on-device as `5'08/km - 5'24/km` (~2.5% either side),
-which reads as "hit close to this pace," the opposite of the intended "no
-real floor" meaning, and actively counter-productive for what's supposed to
-be a recovery interval.
-
-Fixed by flooring an open (`lo_pct <= 0`) lower bound at a fixed
-`_OPEN_LOWER_BOUND_FLOOR_PCT = 40` (%VMA) instead of leaving it as a single
-value, producing an explicit, honestly-wide range (`5:16-8:34/km` for
-VMA 17.5's `0-65%`) that a device renders as given, no auto-banding. This
-constant is a deliberate product choice ("a very easy jog"), not extracted
-from any PDF or derived from anything - the user explicitly preferred a
-fixed %VMA floor over the alternative that was considered (reusing the
-warm-up segment's own pace as the floor, which was rejected for silently
-assuming every workout has a warm-up to borrow from). Verified server-side
-after re-pushing: `workout_doc` shows `{"pace": {"start": 316, "end": 514,
-"units": "secs/km"}}` (5:16 → 8:34) on the recovery steps, `moving_time`
-still 3400.
-
-## Generalizing beyond the first sample PDF
-
-The first PDF (hill sprints, `example/2026-09-10/`) shaped every design
-decision above. Two more real PDFs arrived once the pipeline was live
-(`example/2026-09-15/` stairs, `example/2026-09-17/` a threshold pyramid),
-and both broke assumptions baked in from having only ever seen one sample.
-Worth internalizing: **this PDF template has more variation between
-individual workouts than it first appeared, and a fixed-coordinate approach
-will keep breaking on new ones.** What follows is what actually generalizes
-and what still doesn't.
-
-### Absolute pixel coordinates don't generalize - use relative structure instead
-
-The original `_parse_main_row` filtered words by hardcoded `top` bands
-(`128 <= top <= 136` for durations, `140 <= top <= 150` for the rest row),
-reverse-engineered from the one sample PDF available at the time. The stairs
-PDF's section headers happen not to wrap onto a second line, which shifts
-every row below them up by ~9pt - so the hardcoded bands missed the grid
-entirely. Worse: this failed **silently**. `_parse_main_row` returned an
-empty list, which cascaded to zero segments, an empty `to_intervals_icu_text()`
-string, and - because nothing anywhere checked for this - an actual empty
-session pushed to the athlete's COROS watch, with a real email notification,
-and no error at any layer. This is why `parse_planiteam_pdf` now raises
-`ValueError` when it parses zero segments (see below) - that incident is
-exactly the failure mode that check exists to prevent.
-
-The fix: find these two rows **relative to each other**, not at fixed
-coordinates. Every observed PDF has exactly one row containing `==>` tokens
-(the "rest" row), so `_parse_main_row` now locates that row via
-`_cluster_rows` (which does relative y-clustering already, unaffected by
-this bug) and walks upward from it to find the duration row. That walk isn't
-simply "one row up", either: the pace table's own `VMA` column-header label
-sits, on some PDFs, as its own single-word row squeezed into the gap between
-the duration row and the rest row - so the code walks upward past any row
-that doesn't contain an `Nx` repeat marker, rather than assuming adjacency.
-Both quirks were only found by actually diffing what broke against what
-worked, not by inspecting one PDF in isolation.
-
-The pace table had the same class of bug, for a different reason: its row
-grouping used a fixed clustering tolerance (`tol=1.5`) to merge a row's VMA
-label with its pace values, but the vertical offset between them varies by
-PDF (0.4-2.2pt observed) - tight enough that the stairs PDF's ~2.2pt offset
-fell outside the old tolerance and silently dropped every row. Fixed by
-anchoring differently: find each VMA-label word (leftmost column, `x0 < 90`,
-matching the numeric label pattern) directly, then gather pace-shaped tokens
-within a generous `±6pt` vertical window of *that specific label* - decoupled
-from the generic row-clustering primitive entirely, since this relationship
-(a label and its own row's values) needed a wider tolerance than everything
-else on the page.
-
-### `ÉCHAUFFEMENT` wraps at a different letter on every PDF - don't chase exact splits
-
-Three PDFs, three different line-wrap points for the same French word:
-`ÉCHAUFFEM`/`ENT` (first sample), `ÉCHAUFFEME`/`NT` (pyramid). Chasing exact
-fragment pairs in `_HEADER_JOIN_FIXUPS` doesn't scale - there's no way to
-predict where Planiteam's renderer will break a word next. Since warm-up/
-cool-down role detection is the only thing that actually depends on getting
-this right (the section's *name* is never shown - see below), the fix was
-to make that specific check tolerant instead of trying to perfectly
-reconstruct the joined text: strip whitespace from the header text before
-substring-matching `CHAUFFEMENT`/`CALME`. `ÉCHAUFFEME NT` (imperfectly
-joined, extra space) still matches `CHAUFFEMENT` once spaces are stripped,
-regardless of exactly where the PDF wrapped the word. `_HEADER_JOIN_FIXUPS`
-is left in place for the cases it already handles (cosmetic `Segment.name`
-values, e.g. in JSON output) but is no longer load-bearing for correctness.
-
-### A second, structurally different pace-table layout exists
-
-The pyramid PDF (`seuil-pyramide-2-4-6-4-3-2-min.pdf`) has **no `Z\d` zone
-labels and no `%VMA` overlay anywhere on the page.** Instead its pace table
-has one column *per session phase* - warm-up, each of the 6 efforts, each of
-the 5 recoveries, cool-down: 13 columns total, each independently computed
-per VMA row (confirmed by checking column values against x-position
-alignment with each phase's block above, the same technique used to
-originally confirm the 2-column layout against a screenshot). The two
-zone-based PDFs only ever print 2 pace columns (warm-up, cool-down) plus a
-separate zone/percent overlay for the main set.
-
-`parse_planiteam_pdf` now dispatches between the two modes:
-
-```python
-pace_table_columns = len(next(iter(pace_table.values()), []))
-total_flat_entries = sum(len(block["entries"]) for block in blocks)
-use_per_step_pace = not zones and pace_table_columns > 2 and pace_table_columns == total_flat_entries
-```
-
-i.e.: no zone overlay was found, *and* the pace table's column count exactly
-matches the total number of entries across every block on the page (13 for
-the pyramid: 1 warm-up + 11 main-set + 1 cool-down). When true, each entry's
-target is looked up directly from its corresponding pace-table column via a
-single running `flat_index` cursor that increments across the whole
-workout, in page order - not just within the main block, since the count
-check only holds when warm-up and cool-down's own entries are included in
-the flattened total too.
-
-Effort/recovery classification in this mode has no zone data to lean on, so
-it falls back to positional alternation: the first entry of a multi-entry,
-non-warmup/cooldown block is `"Effort"`, then alternates. This held for
-every workout seen so far (every one starts with an effort), but is a weaker
-assumption than the zone-based path's `_zone_cue` (which compares actual
-zone numbers) - a workout that opened with a recovery would get this wrong,
-and there'd be no way to detect that from a per-step-mode PDF alone.
-
-**Known gap, not yet built**: every per-step-mode PDF seen so far has all
-`r = 0` (blank) rest values within its main block - i.e. no analogue to the
-hill-sprint PDF's trailing `r = 3:00`. If a future per-step PDF combines
-both a nonzero trailing rest *and* per-step pace columns, there's currently
-no code path attributing a pace-table column to that extra step - it's
-appended with `target=None` rather than guessing. Revisit if that PDF shows up.
-
-### Duration formatting needed a combined "1m15s" form
-
-The pyramid's recovery durations (1:15, 1:45, 1:30) aren't whole minutes or
-under 60 seconds, so `_format_duration`'s old two-case logic (`"Nm"` or
-`"Ns"`) had no representation for them - it would have emitted raw seconds
-(`"75s"`) instead. Extended to a third case (`"NmNs"`) and verified live the
-same way every other syntax question in this file was: pushed a probe with
-`1m15s`/`1m45s` targets, read `workout_doc` back, confirmed exact 75s/105s
-durations and a correct `moving_time` total. Confirmed working, not assumed.
-
-### Verifying against real data beats guessing, even for "obvious" assumptions
-
-The stairs PDF's warm-up and cool-down initially looked ambiguous: the
-athlete's hand-typed expected file had both at the same pace (`5:43/km`),
-while the parser computed two different values (`5:16/km` / `5:43/km`).
-Rather than trust either blindly, the pace table's *column x-positions* were
-checked directly against the page: the left pace column sits at the same x
-as the warm-up block's `20:00` duration (under the `ÉCHAUFFEMENT` header),
-and the right column sits at the same x as the cool-down block's `10:00`
-(under `RETOUR AU CALME`). That's independent structural evidence for
-"left column = warm-up, right column = cool-down" beyond the one screenshot
-cross-check the original 2-column assumption was based on - and it disagreed
-with the hand-typed expectation, which turned out to be an unverified guess
-rather than a checked value. Worth remembering: a human-provided "expected"
-file is a hypothesis to check against the source data, not automatically
-ground truth, even when it's the more conservative-looking answer (both
-values equal felt like the "safe" guess here, but wasn't the correct one).
-
-### A multi-step segment gets its "Nx" header even at 1x
-
-Product decision (the athlete's, not derived from any PDF data): a segment
-gets its repeat header (`"1x"`, `"2x"`, ...) whenever it has **more than one
-step**, not only when `repeat > 1`. Originally `to_intervals_icu_text()`
-hid the header whenever `repeat == 1` (the pyramid's own main-set marker,
-since it's a single pass), rendering it as a bare list of steps with no
-grouping at all. The preference, after seeing that rendered: a "core"
-block - the pyramid's main set has no warm-up/cool-down immediately
-recognisable around each rep the way the hill-sprints' `2x` block does -
-should still visually read as one repeated group, "repeated once", rather
-than an undifferentiated list. A single-step segment (warm-up, cool-down, a
-plain drills block like `GAMMES`) never gets a header regardless of its own
-repeat count - there's nothing to group in a single instruction.
-
-Implemented as `len(segment.steps) > 1` replacing the old `segment.repeat > 1`
-condition. Verified live the same way as every other syntax question here:
-pushed a probe with a bare `1x` header, confirmed `workout_doc` shows
-`{"reps": 1, ...}` (not silently dropped or misparsed), then re-pushed the
-real pyramid event with the corrected format and deleted the stale one.
-
-## Sharing sessions with a training club (multi-recipient push)
-
-The original pipeline assumed one athlete = one intervals.icu account. The
-club use case is the same coach's session pushed to several club members at
-once, each with their own VMA (which changes the computed pace targets, see
-above) and their own intervals.icu account (so it lands on *their* COROS
-watch, not just the repo owner's).
-
-### Data model: `Recipient`, not per-athlete config files
-
-`planiteam_to_coros.Recipient` (`name`, `vma`, `api_key`, `athlete_id`,
-`enabled`) is intentionally a flat dataclass with no per-recipient identity
-beyond a display name - there's no user-account system here, no auth beyond
-"whoever holds `RECIPIENTS_JSON` can edit the list." `enabled` exists purely
-so someone can be paused (e.g. travelling) without deleting and later
-re-typing their credentials.
-
-`parse_recipients(raw: str)` parses the whole list from one JSON string and
-raises `ValueError` - not a silent skip - on malformed JSON or a missing
-required field, on purpose: a typo'd entry should fail the *whole* request
-loudly (see below) rather than quietly dropping one person from every future
-push with no indication why their watch stopped getting sessions.
-
-### Why one JSON blob instead of one secret (or one file) per recipient
-
-The natural-looking alternative - a Secret Manager secret per recipient,
-mirroring how `INTERVALS_ICU_API_KEY`/`INTERVALS_ICU_ATHLETE_ID` used to
-each be their own secret - was rejected because `gcloud functions deploy
---set-secrets` requires every secret binding to be named explicitly in the
-deploy command. Adding a recipient would then mean editing
-`.github/workflows/deploy.yml` (and the manual deploy command in
-DEPLOYMENT.md) *and* granting IAM access *and* pushing a code change, just
-to add one person - directly against the stated goal of this being easy to
-add/remove people.
-
-Collapsing the whole list into a single `RECIPIENTS_JSON` secret means the
-`--set-secrets` binding is written once and never touched again: adding or
-removing someone is purely a data change (`gcloud secrets versions add
-RECIPIENTS_JSON --data-file=recipients.json`), not a deploy-config change.
-This relies on a real Cloud Run/Cloud Functions Gen2 property (not just
-assumed from the OpenAPI-docs-aren't-enough lesson elsewhere in this file,
-but documented Google behaviour worth flagging as unverified-live-here): a
-`:latest`-pinned secret is resolved when an instance *starts*, not baked in
-at deploy time - so a new secret version reaches the function on its next
-cold start, no redeploy required. An already-warm instance keeps its
-already-loaded value until it recycles.
-
-Locally, the same `RECIPIENTS_JSON` shape is just another `.env` line (or,
-per DEPLOYMENT.md, a gitignored `recipients.json` used to seed the secret) -
-same `parse_recipients()` code path reads it whether the value came from
-dotenv or Secret Manager, exactly like the single-athlete credentials always
-worked.
-
-### Per-recipient failure isolation, not all-or-nothing
-
-`push_to_recipients()` re-parses the PDF once per enabled recipient (not
-just re-pushes a shared `Workout`) because `vma` changes the computed pace
-targets - each recipient's targets are genuinely different data, not just a
-different destination account. Each recipient's parse+push is wrapped in its
-own `try`/`except`; one recipient's failure (revoked key, some VMA-specific
-parse edge case) is captured into that recipient's own `PushResult` rather
-than raising and aborting the loop.
-
-This was a deliberate product choice, not the obvious default: the athlete
-explicitly preferred isolating failures over failing the whole run, since
-the whole point is that other people's setups (which the repo owner doesn't
-control) can break independently of the PDF/parser itself, and one broken
-account shouldn't hold the rest of the club's session hostage. `main.py`
-reflects this in its status code: the whole request only fails (502, which
-makes Apps Script label the email `PlaniTeam-Sync-Error` and retry-eligible)
-when **every** recipient failed - a partial failure still returns 200 (email
-marked read) with a `results` array documenting who did and didn't get
-pushed. Per-recipient failures are surfaced only via the Cloud Function's
-own logs (`print()`, one line per recipient, by name - matching the
-explicit ask to be able to identify whose setup is broken) and the response
-body; there's no separate alerting channel for this, and none was asked for.
-
-## A third round of real PDFs broke the flat-count/sequential-index approach
-
-Six more real PDFs arrived (`example/2026-09-22` through `example/2026-10-08`),
-most producing silently-wrong or empty output. The common root cause: almost
-every piece of per-entry matching in the parser (pairing a duration to its
-own "r = rest" value, a Z-zone/%VMA overlay token to its entry, a pace-table
-column to its entry) was done either by a **flat sequential index** (consume
-the next item off a shared iterator/counter) or by a **flat count comparison**
-(this block's entry count equals the *whole page's* zone-token count). Both
-assumptions broke as soon as a PDF had more than one zoned block, an extra
-placeholder entry, or a shifted table. See `ARCHITECTURE.md` for the current
-per-block dispatch shape this section explains the reasoning behind.
-
-**The fix, applied uniformly**: every one of these pairings is now done by
-**nearest x-position** (`_nearest_payload`/`_nearest_column_index`/
-`_consume_nearest_rest`, tolerance `_X0_MATCH_TOL = 20pt`), never by a flat
-index or whole-page count. Measured offsets between a real entry and its own
-rest-group/zone/percent/pace-column are consistently 2-12pt across every
-sample seen; the next *other* real entry is never closer than ~48pt. That
-margin is comfortable, but it is specific to this template's grid spacing -
-if a future PDF packs entries tighter than that, this tolerance would need
-revisiting (dump the words and check the actual spacing before assuming).
-
-### "Consigne" free-text notes leave an orphaned "r = 0" that desyncs sequential pairing
-
-Two PDFs print a "Consigne" annotation word inline on the duration row
-(instead of, or alongside, a real duration), with its own unused
-`r`/`=`/`0` triple on the rest row beneath it. A purely sequential
-"consume the next rest value for the next duration token" pairing (the
-original implementation) silently shifts every *subsequent* rest value by
-one as soon as it skips over the non-duration "Consigne" token - wrong
-recovery values on every following entry, with no error anywhere. Matching
-each entry to its *nearest* rest-group by x0 instead makes the orphaned
-group simply match nothing (it's 100+pt from the nearest real entry, far
-outside tolerance) and everything else resolves correctly. See
-`_parse_rest_groups`/`_consume_nearest_rest`.
-
-When "Consigne" gets its own `1x` block (no real duration follows before the
-next repeat marker), that block parses to zero entries. `parse_planiteam_pdf`
-now skips any zero-entry block outright (no Segment is created) rather than
-rendering an empty stub - confirmed correct against two PDFs where the
-corresponding section header (always "GAMMES") has no line at all in the
-athlete's own expected output for that session.
-
-### VMA-split distance entries ("500m", "1.0km") and the correct intervals.icu syntax
-
-Some workouts (VMA-interval or long-tempo sessions) specify a main-set
-entry as a **distance** instead of a time - e.g. "500m", "300m", "1.0km" on
-the duration row, parsed via `_DISTANCE_M_RE`/`_DISTANCE_KM_RE` into
-`entry["distance_m"]` (with `entry["duration_s"]` left `None`) and rendered
-by `Step.render()`/`_format_distance()` instead of `_format_duration()`.
-
-The intervals.icu text syntax for this was **not guessed** - pulled from the
-same forum guide already cited elsewhere in this file
-(https://forum.intervals.icu/t/workout-builder-syntax-quick-guide/123701,
-fetched via its Discourse JSON endpoint, `<url>.json`, since a plain `curl`
-of the HTML only returns the client-side app shell with no post content) and
-then **verified live** the same way every other syntax question in this repo
-has been: pushed a probe with `500mtr 3:26/km Pace` and `1.0km 3:54/km Pace`
-steps, `GET` the event back, confirmed `workout_doc` shows
-`{"distance": 500, "pace": {...}}` and `{"distance": 1000, "pace": {...}}`
-respectively (not a bogus 500/1000-*minute* step, which is what a bare "m"
-or no unit at all would have silently produced - CLAUDE.md's own earlier
-"`m` means minutes, not meters" trap applies here just as much as to a plain
-duration). The required distance suffix is **`mtr`**, not `m` (a bare `m`
-is minutes) and not `mt` (an earlier guess in this repo, before this was
-checked - wrong, never actually tried against the API). `km` works directly,
-decimals included (`"1.0km"` parses to a real 1000m distance step).
-
-### The pace table can have a *third* column kind: a raw split-time, not a pace/km
-
-Previously `_parse_pace_table` only recognised apostrophe-formatted cells
-(`"7'42/km"`) as pace data. One PDF (`6-a-8x1000m-avec-relances`) prints a
-*third* table column in plain `mm:ss` colon format (e.g. `"05:41"`) for the
-distance-based main-set entries - this is the time to cover *that block's
-own distance* at each VMA row, not a pace/km value, even though for a
-1000m-distance block the two happen to be numerically identical (so it was
-easy to miss the distinction from one example alone). A second PDF
-(`vma-6x500m-6x300m-avec-relances`) confirmed the distinction matters: its
-own raw columns are split times for 500m and 300m respectively, and must be
-rescaled by `seconds * 1000 / distance_m` before they're a valid pace/km -
-using them unscaled would understate the pace (e.g. a 300m split read
-directly as if it were a per-km pace).
-
-`_parse_pace_table` now tags every cell with a `kind` (`"pace"` for
-apostrophe format, used as-is; `"raw"` for colon format, rescaled by
-`_pace_cell_to_target` using the *consuming entry's own* `distance_m` -
-`None`/no rescale when the entry is time-based, which is what every
-warmup/cooldown apostrophe-format column has always been).
-
-### A block can have its own zone/percent overlay independent of other blocks on the same page
-
-The original single-main-set sample had exactly one zoned block, so
-"collect every Z-token/percent-token on the page into one flat list and
-zip it against this block's entries" happened to work. A later PDF
-(`cotes-2x6x40-`) has **two** separate zoned blocks (two "6x40\" côtes"
-series, each its own repeat group with its own single `Z5`/`95-100%` token
-pair) - the flat-zip approach required each block's entry count to equal
-the *whole page's* zone-token count, which broke as soon as there was more
-than one zoned block. Zone/percent matching is now done the same
-nearest-x0 way as everything else: each entry independently finds its own
-nearest `Z#` and percent-band token (`_nearest_payload`), so two
-(or more) independently-zoned blocks on the same page no longer interfere
-with each other.
-
-### A trailing rest only gets a pace if the block actually uses a *second* zone
-
-The original sample's "recovery before the outer repeat" rest step got a
-pace by borrowing the block's *other* zone (Z1, since the block alternates
-Z5/Z1). Several newer single-effort-zone blocks (one zone token per block,
-e.g. a `Z4`-only "500m en côtes" block, or either `Z5`-only "40\" côtes"
-series) have **no** second zone to borrow from. The original
-`zone_by_duration`-keyed fallback didn't know the difference and reused the
-effort's own zone/pace for the recovery - wrong, and caught by diffing
-against the athlete's own hand-verified expected output (every such
-recovery line has no pace at all). `_build_zone_steps` now only targets a
-rest step when a *distinct* zone is actually present somewhere else in that
-same block (`distinct` list, deduped by zone letter) - otherwise the rest is
-left untargeted, matching every sample seen so far.
-
-### VMA reference table label column position is not fixed either
-
-`_parse_pace_table` used to require the VMA-row label words to sit at
-`x0 < 90`. One PDF (`6-a-8x1000m-avec-relances`, whose longer title needs
-different centring) prints its whole table shifted right, with labels at
-`x0 ≈ 123-127` - the hardcoded threshold found zero label rows, so the
-table parsed to **empty**, and from there every pace on that entire
-workout (warm-up, main set, cool-down alike) silently came back
-`target=None` with no error anywhere. Fixed the same way the rest of this
-file's "don't hardcode a page coordinate" lesson keeps re-applying: find the
-*leftmost* VMA-shaped word on the page, then treat anything within 15pt of
-that minimum as a label. Within one PDF the label column's own horizontal
-jitter is small (4-10pt); it's only the *absolute* position that moves
-between PDFs.
-
-### A "+"-joined header can span two different entries that need different treatment
-
-One PDF (`seuil-12-8-6-3-`) prints a single centred header,
-"ÉCHAUFFEMENT + GAMMES", over what is - on the duration row - two distinct
-entries sharing one `1x` repeat marker (a 20:00 warm-up, a 5:00 drills
-block). Treating it as one combined segment would apply the warm-up's
-`role`/pace to the drills entry too (or vice versa). `_expand_combined_headers`
-splits a header on `" + "` and pairs each resulting name 1:1 with the
-block's own entries, *but only when the part-count exactly matches the
-entry-count* - this is deliberately conservative so it never fires on an
-unrelated header that happens to contain a "+" (none seen so far do; a page
-*title* containing "+" is common but titles aren't in the header band at
-all, so this never had false positives to guard against beyond the count
-check).
-
-### "Effort Cotes" cue for hill-repeat blocks
-
-The athlete's own convention: any block whose own section name mentions
-hill repeats ("côtes" - checked accent/case-insensitively via
-`_mentions_cotes`, `unicodedata`-stripped) gets `"Effort Cotes"` instead of
-a bare `"Effort"` as its cue, recovery steps unaffected (still plain
-`"Récupération"`). Cosmetic (it's the on-device block-name text, see the
-"Every block gets a device-visible name via `Step.cue`" section above), but
-worth keeping consistent since it's now the athlete's explicit labelling
-preference, not just whatever the PDF's own section name happened to say.
-
-### %VMA-band targets always render as a range, even for short efforts - confirmed, not assumed
-
-When fixing the cue text above, several of the newer hand-typed expected
-files showed a *single* pace value (e.g. "3:36/km") for short côtes efforts,
-instead of the two-sided range ("3:26-3:37/km") the original sample uses and
-that was already verified live against the API (see "Main-set targets are
-computed from %VMA directly" above). Checked whether those single values
-were a deliberate simplification (midpoint of the range, or some other
-derivable number) before assuming either way: they don't match the range's
-midpoint, any obvious alternate rounding, or anything printed anywhere else
-on those PDFs - they look like manual approximations made while hand-typing
-the expected file, not a computed value. Asked the athlete directly rather
-than guess given this changes on-device behaviour either way: confirmed the
-range format should stay, for every %VMA-band target, regardless of effort
-length. The handful of expected files with a single value for this are
-simply wrong and were not special-cased.
-
-### Hand-typed `expected.*.txt` files had several more small errors - don't chase these
-
-Cross-checked every new `expected.workout.intervals.txt` against its source
-PDF's own raw data (same technique as "Verifying against real data beats
-guessing" above) before trusting it. Found, and deliberately did *not*
-special-case the parser to reproduce:
-
-- `2026-09-22`: expected cooldown duration "15m" vs the PDF's own duration
-  row, which clearly reads `10:00` under the "RETOUR AU CALME" header.
-- `2026-09-24`: expected inter-block rest duration "3m" vs the PDF's `04:00`.
-- `2026-09-22`/`2026-09-24`/`2026-09-29`: distance-step suffix typed as
-  "mt" - not a real intervals.icu unit (see "mtr" above).
-- `2026-09-24` vs `2026-09-29` vs `2026-09-10`/`2026-09-15`: the same
-  "GAMMES ET ÉTIREMENTS"/"GAMMES" drills block is rendered three different
-  ways across the athlete's own expected files - full title-case, a
-  lowercased-and-accent-dropped "et Etirements", and truncated to just
-  "Gammes". `_display_name`'s existing title-case convention was kept
-  (matches the two oldest, presumably most-reviewed samples) rather than
-  chasing any one of the inconsistent newer variants.
-- `2026-09-29`: expected "2m30" (missing the trailing "s" that
-  `_format_duration`'s own documented "NmNs" convention always produces).
-- `2026-10-01`: expected pace "4:08/km" for the pyramid's final effort step,
-  but that column's own x0 lines up (within the usual ~10pt offset) with a
-  *different* table value, "3:59/km" - double-checked by measuring every
-  other column's offset from its own entry first (all a consistent ~10pt)
-  before concluding this one specific hand-typed value, not the extraction,
-  is what's off.
-
-None of these were special-cased into the parser logic - they were flagged
-back to the athlete instead (per this file's standing "a human-provided
-expected file is a hypothesis to check against the source data, not
-automatically ground truth" rule, established earlier in this file and
-re-confirmed repeatedly this round).
-
-## Targets dropped on purpose: warm-up, cool-down and côtes (Nov 2026)
-
-Athlete's product decisions after using the synced sessions on the watch:
-
-- **Warm-up/cool-down get no pace target**, even though the pace table still
-  prints one (the 60%/55% columns documented above are no longer consumed for
-  role blocks - `_build_role_steps`). The on-watch pace alerts were more
-  distracting than useful during those phases.
-- **Côtes blocks get no pace target at all** (efforts and recoveries), only a
-  cue. Asked first whether COROS's grade-adjusted "Allure d'effort" target
-  could be used instead: it can't. intervals.icu's API only knows `GAP` for
-  analysis (curves/zone times; workout targets are `POWER/HR/PACE`), and the
-  FIT `workout_step` target-type enum has no grade-adjusted variant - any
-  pace target reaches the watch as plain `speed`. COROS effort pace is only
-  settable in COROS's own app. Since the pace no longer shows, the PDF's zone
-  label is appended to the cue instead (`Effort Cotes Z5`,
-  `Récupération Z1`); a rest with no zone token of its own stays a bare
+There is no Planiteam API; the PDF export is the only data source. The code
+map is in [ARCHITECTURE.md](ARCHITECTURE.md). This file records what was
+reverse-engineered or **verified live** and the product decisions behind
+the rules - read it before changing behaviour.
+
+## Working rules
+
+- **Verify against real data, not assumptions.** Every intervals.icu syntax
+  fact below was confirmed by pushing a probe event, `GET`ting it back and
+  inspecting `workout_doc` (the server's own parse of `description`) and
+  `moving_time`. A `200 OK` with no errors once still produced a wrong
+  workout (missed repeat, power instead of pace). Clean up probe events
+  (`DELETE /api/v1/athlete/{id}/events/{eventId}`).
+- **Hand-typed `expected.workout.intervals.txt` files are hypotheses.**
+  Several had errors (a duration copied from another session, `mt` instead
+  of `mtr`, a single pace instead of a range, a pace read from the wrong
+  column). Check them against the PDF's own words before bending the parser.
+- **Fail loudly.** An unknown layout must raise `ValueError` (the Cloud
+  Function then returns 502 and Apps Script labels the email
+  `PlaniTeam-Sync-Error`). A silently degraded parse once pushed an empty
+  session to the watch.
+- **Never use absolute page coordinates.** Every one tried so far broke on
+  the next PDF. Locate things relative to the grid rows and match by nearest
+  x0.
+- Accented text printed to this Windows terminal shows as `�`: a cp1252
+  console artefact, not corrupted data. Always read/write files as UTF-8.
+
+## The PDF
+
+A coordinate dump: section titles, the interval grid and a VMA pace table
+are independent text objects. Linear text extraction interleaves them into
+garbage - always parse via `page.extract_words()` positions.
+
+Layout, top to bottom (positions vary between PDFs, the order doesn't):
+
+1. **Title** (left) and `Édité le DD/MM/YYYY` (right) on the first row. The
+   PDF has **no session date** - it comes from the notification email
+   (`--date`, or the Apps Script payload).
+2. **Section headers**, centred over their block (not aligned), possibly
+   wrapped onto a second row - sometimes mid-word, at an unpredictable
+   letter (`ÉCHAUFFEM`/`ENT`, `ÉCHAUFFEME`/`NT`). Grouped by horizontal
+   overlap and paired 1:1, in order, with the grid's `Nx` blocks. Planiteam
+   itself clips long headers (`... / MARCH` for `MARCHE`).
+   A header like `ÉCHAUFFEMENT + GAMMES` over a block with exactly two
+   entries is split into two blocks.
+3. **Duration row**: `Nx` repeat markers followed by entries: `mm:ss`,
+   distances (`500m`, `1.0km`), `Lap`, or a free-text `Consigne` (ignored;
+   a `Nx` followed only by `Consigne` is an empty block, skipped).
+4. Sometimes a lone `VMA` word row.
+5. **Rest row**: `==> r = <value>` under each entry. `<value>` is the extra
+   rest after that entry (`0`/blank = none). A non-zero rest on the last
+   entry is the recovery before the outer repeat. Rests are matched to
+   entries by nearest x0 - `Consigne` carries an orphan `r = 0` that would
+   desync sequential pairing.
+6. **Below the grid**: the VMA reference table, plus (on some PDFs) a zone
+   overlay - `Z5`/`Z1` labels and `95-100%`/`0-65%` bands placed under the
+   main-set entries. The overlay just happens to share `top` with some table
+   rows; it is metadata for the grid, matched to entries by nearest x0.
+
+### The pace table: every column is a constant %VMA
+
+Rows are reference VMAs (12 -> 23 km/h, not the athlete's own; the label
+column's x varies between PDFs). Each column is one session phase and is a
+**constant %VMA** across all rows (measured: 55, 60, 65, 68, 80, 83, 85, 86,
+88, 90, 100%) - so `_PaceColumn.vma_pct()` derives the % and the athlete's
+pace is computed directly from their VMA. Cell kinds:
+
+- `7'42/km` - a pace per km.
+- `05:41` - a **split time for the entry's own distance** (e.g. 300m), to be
+  rescaled by that distance. For a 1000m entry it equals the pace, which
+  made this easy to miss.
+- `-` - no target for that phase.
+
+Two-column tables (warm-up, cool-down) appear on PDFs with a zone overlay;
+others have a column per phase. The column-derived pace can differ by 1s
+from the printed cell (cells are rounded; the 300m split showed 3:27 for an
+exactly-100% target computed as 3:26) - the computed value is used.
+
+## Step rules (product decisions)
+
+- **Warm-up / cool-down** (header contains `CHAUFFEMENT` / `CALME`, spaces
+  stripped): `Warmup`/`Cooldown` header line, no cue, **no pace target**
+  (pace alerts during those phases were more distracting than useful).
+- **Effort vs recovery**: `Z1`/`Z2` recovery, `Z3+` effort
+  (`_MAX_RECOVERY_ZONE`; one PDF mixes Z4 and Z5 efforts). Without a zone,
+  %VMA below 70 is a recovery. No intensity source for a step in an
+  interval block -> `ValueError`.
+- **Recoveries never get a pace target** (the athlete wants them free of
+  alerts). Every attached `r = rest` is an untargeted `Récupération` step.
+- **Efforts** get the %VMA target: a zone-overlay band renders as a range
+  (`3:26-3:37/km`, kept as a range even for short efforts - confirmed with
+  the athlete), a pace column as a single pace.
+- **Côtes** (header mentions `côte`, accent-insensitive): no pace target at
+  all - a flat-ground pace is meaningless on a slope, and COROS's
+  grade-adjusted "Allure d'effort" can't be set via intervals.icu/FIT (the
+  FIT target-type enum has no grade-adjusted variant; intervals.icu's `GAP`
+  is analysis-only). The zone goes in the cue instead: `Effort Cotes Z5`,
+  `Récupération Z1`; a rest with no zone label of its own is a bare
   `Récupération`.
-- **Recovery steps get no pace target either**, in every block type
-  (low-zone entries, trailing rests, odd entries of a per-step-pace block).
-  This makes the 40% `_OPEN_LOWER_BOUND_FLOOR_PCT` floor described above
-  effectively unused today (it only ever applied to `0-65%` Z1 recoveries);
-  it's kept in `_vma_pace_target` in case a low-bound-0 band ever targets an
-  effort.
-- **Effort vs recovery is now by absolute zone number** (`_MAX_RECOVERY_ZONE
-  = 2`: Z1/Z2 recovery, Z3+ effort) instead of "highest zone in the block is
-  the effort". The 2026-11-02 PDF mixes Z4 and Z5 efforts in one block, and
-  the old rule labelled its Z4 efforts "Récupération" - the failure mode the
-  zone-cue section above predicted for blocks with more than two zones.
+- **Plain single-entry blocks** (drills, an inter-block jog, a tempo): cue =
+  header name, title-cased (`Gammes`, `Récup Footing Avant Tempo`); a target
+  only when its own pace column says effort (e.g. an 80% tempo).
+- **`Lap` entries**: open-ended drills, own segment with cue `Gammes`
+  (`_LAP_CUE`), placeholder 10 min (`_LAP_DEFAULT_DURATION_S`), keeping the
+  enclosing block's role.
+- **Repeat header**: a segment with more than one step gets `Nx` even at
+  `1x` (so a lone core block reads as a group); a single-step segment never
+  does.
 
-## "Lap" entries: open-ended drills ended by the lap button
+## intervals.icu: verified facts
 
-The 2026-11-02 PDF prints `Lap` instead of a duration as the second entry of
-its ÉCHAUFFEMENT block (pace table shows `-` under it). Verified live (probe
-pushed, `GET` + `download.fit` inspected, deleted): any step line containing
-`Press lap` gets `"until_lap_press": true` in `workout_doc` and exports to FIT
-as `duration_type: 'open'`, `target_type: 'open'` - no time limit, no target,
-ends on a lap press. Works under a `Warmup` header too (`intensity: 'warmup'`
-in the FIT). Caveats seen in that probe:
+Endpoint and schema from the OpenAPI spec (`curl -s
+https://intervals.icu/api/v1/docs -o spec.json`; don't use a summarising
+fetch tool, the spec is too large). The `description` text grammar is only
+documented in the forum guide
+(https://forum.intervals.icu/t/workout-builder-syntax-quick-guide/123701 -
+fetch `<url>.json`, the HTML is an empty app shell). All verified live:
 
-- A duration is still required in the text; it only feeds intervals.icu's
-  planned total (`moving_time`), not the device. `_LAP_DEFAULT_DURATION_S`
-  (10 min) is the athlete's choice, not from the PDF.
-- intervals.icu keeps "Press lap" inside the step name (`wkt_step_name:
-  'Gammes Press lap'`), so the watch most likely shows it as part of the
-  block name.
-- Not yet confirmed how COROS presents an open-duration step on-device.
+- `POST /api/v1/athlete/{id}/events`, HTTP Basic auth, username literally
+  `API_KEY`, password = the API key.
+- **Repeats**: a bare `2x` line (no `- `), child steps as plain `- ` bullets
+  at the same indentation, blank line before/after. Getting this wrong
+  silently runs the block once. `1x` is accepted (`{"reps": 1}`).
+- **Pace targets need a `Pace` suffix**: bare `Z5` is a *power* zone; a
+  bare `5:43/km` is silently dropped.
+- **Zones are resolved server-side**: `Z5 Pace` is converted to an absolute
+  speed range from the athlete's intervals.icu zone config before the FIT
+  export (`target_speed_zone` is always 0 in the `.fit` from
+  `.../events/{eventId}/download.fit`). So zones can't defer to the watch's
+  own threshold; targets are computed here from %VMA instead, which also
+  removes any dependency on intervals.icu's zone settings.
+- **A single-value pace target** gets a tight auto-band on COROS (`5:16/km`
+  showed as `5'08-5'24`). A `0-x%` band has no finite slow bound and is
+  refused at render time (only Z1 recoveries have one, and they're untargeted).
+- **`Warmup` / `Cooldown`** header lines are the only way to get
+  `"warmup": true` / `"cooldown": true`; must be the English keyword (the
+  French `ÉCHAUFFEMENT` doesn't work). COROS then shows them localised
+  ("Echauffement", "Retour au calme") - confirmed on a real watch.
+- **No equivalent for recovery**: `Recovery`/`Rest`/`Interval` as a header
+  line are dropped, inside or outside repeats. As a leading word on a step
+  line it becomes the step's `"text"`.
+- **Cue text** (leading words on a step line) becomes the step's `"text"`,
+  shown by COROS as the block name - confirmed on the device.
+- **Durations**: `20s`, `10m`, `1m15s`. **Distances**: `500mtr` (a bare `m`
+  means *minutes*; `mt` is invalid), `1km` / `1.0km`.
+- **`Press lap`** on a step line -> `"until_lap_press": true`, exported to
+  FIT as `duration_type: 'open'`, `target_type: 'open'`; the duration is
+  still required but only feeds `moving_time`. intervals.icu keeps "Press
+  lap" in the step name (`Gammes Press lap`). Not yet confirmed how COROS
+  displays an open step.
+- **No idempotent upsert**: client-supplied `uid` is ignored (the server
+  assigns its own), so every push creates a new event and re-pushing
+  duplicates it. Real idempotency would need the returned event id cached
+  and reused as a `PUT` target - not built, nobody asked for it.
 
-Each `Lap` entry is split out into its own segment (`_split_lap_entries`),
-keeping the enclosing block's role, cue `_LAP_CUE = "Gammes"` (athlete's
-choice - the PDF header above it is just ÉCHAUFFEMENT). It must be a separate
-segment: one `Warmup` header over a two-step block would render as a `1x`
-repeat group.
+## Club push (multiple recipients)
+
+`intervals_icu.Recipient` (`name`, `vma`, `api_key`, `athlete_id`,
+`enabled`) comes from one `RECIPIENTS_JSON` value: a Secret Manager secret
+in the cloud, `.env` or a gitignored `recipients.json` locally.
+`parse_recipients` raises on malformed JSON or a missing field rather than
+silently dropping someone.
+
+One JSON secret instead of one per person: `gcloud functions deploy
+--set-secrets` names every binding explicitly, so per-person secrets would
+need a deploy-config change to add someone. A `:latest` secret is resolved
+at instance start, so a new version applies on the next cold start without
+redeploying (Google-documented, not verified live here).
+
+The PDF is parsed once; `push_to_recipients` renders it with each
+recipient's VMA and pushes, isolating failures per recipient (the athlete's
+explicit preference: other people's accounts can break independently).
+`main.py` returns 502 only when parsing fails or **every** push fails;
+partial failures return 200 with a per-recipient `results` array and one
+log line per recipient.
+
+## Tests
+
+- `tests/test_examples.py`: one test per `example/<date>/` folder (named
+  after the session date) comparing the rendered text at `DEFAULT_VMA` with
+  `expected.workout.intervals.txt`. It always writes
+  `actual.workout.intervals.txt` (gitignored) next to it for diffing. Adding
+  a folder with a PDF and an expected file is enough to add a test. Uses
+  `unittest` (VSCode Testing tab via `.vscode/settings.json`), not pytest.
+- `tests/test_planiteam_to_coros.py`: what the examples can't show - other
+  VMAs, %VMA extraction, fail-loudly cases, render syntax, recipients/push.
+- Cheapest sanity check on a new PDF: the sum of step durations × repeats
+  should equal the total Planiteam's UI shows (56:40 for `2026-09-10`).

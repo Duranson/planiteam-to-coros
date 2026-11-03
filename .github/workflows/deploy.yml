@@ -14,6 +14,7 @@ on:
     paths:
       - "main.py"
       - "planiteam_to_coros.py"
+      - "intervals_icu.py"
       - "requirements.txt"
       - ".gcloudignore"
       - ".github/workflows/deploy.yml"

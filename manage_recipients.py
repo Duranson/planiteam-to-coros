@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from planiteam_to_coros import parse_recipients
+from intervals_icu import parse_recipients
 
 SECRET_NAME = "RECIPIENTS_JSON"
 

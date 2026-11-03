@@ -7,10 +7,10 @@ that output next to the PDF as ``actual.workout.intervals.txt`` (always,
 whether the test passes or fails - open it side by side with
 ``expected.workout.intervals.txt``, or just ``git diff``/the editor's diff
 view, to see exactly what's wrong), and compares it against that folder's
-hand-checked ``expected.workout.intervals.txt``. See CLAUDE.md for how those
-expected files were themselves checked against the source PDFs - a mismatch
-here is sometimes the parser being wrong, sometimes the expected file being
-wrong.
+hand-checked ``expected.workout.intervals.txt`` (rendered at ``DEFAULT_VMA``).
+See CLAUDE.md for how those expected files were themselves checked against
+the source PDFs - a mismatch here is sometimes the parser being wrong,
+sometimes the expected file being wrong.
 
 Test methods are attached to the class dynamically at import time (one
 ``setattr`` per folder, below), which is the one requirement for a test
@@ -23,7 +23,7 @@ import re
 import unittest
 from pathlib import Path
 
-from planiteam_to_coros import parse_planiteam_pdf
+from planiteam_to_coros import DEFAULT_VMA, parse_planiteam_pdf
 
 EXAMPLE_ROOT = Path(__file__).resolve().parent.parent / "example"
 ACTUAL_FILENAME = "actual.workout.intervals.txt"
@@ -61,7 +61,7 @@ def _make_test(pdf_path: Path, expected_path: Path):
     def test(self):
         actual_path = expected_path.with_name(ACTUAL_FILENAME)
         workout = parse_planiteam_pdf(pdf_path)
-        actual = workout.to_intervals_icu_text()
+        actual = workout.to_intervals_icu_text(DEFAULT_VMA)
         # Written before the assertion, so it's on disk to inspect even
         # when the comparison below fails.
         actual_path.write_text(actual, encoding="utf-8")

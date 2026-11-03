@@ -1,104 +1,74 @@
-# Architecture of `planiteam_to_coros.py`
+# Architecture
 
-This is a map of how the script turns a Planiteam PDF into intervals.icu
-structured-workout text. For *why* each design choice was made (and the live
-API probing that justified it), see [CLAUDE.md](CLAUDE.md) - this file is
-just the shape of the logic.
+How a Planiteam PDF becomes intervals.icu structured-workout text. For *why*
+each rule exists (and the live API probing behind it), see
+[CLAUDE.md](CLAUDE.md).
 
-## 1. End-to-end pipeline
+## Modules
 
-```mermaid
-flowchart TD
-    PDF["Planiteam PDF\n(single page)"] --> EXTRACT["_extract_page_words()\npdfplumber: words + x0/x1/top positions"]
+| Module | Role |
+|---|---|
+| `planiteam_to_coros.py` | PDF -> VMA-independent `Workout` -> text for a given VMA. Also the CLI. |
+| `intervals_icu.py` | Recipients list, event payload, push (one event per recipient). |
+| `main.py` | Cloud Function: parse the PDF once, push to every recipient. |
 
-    EXTRACT --> TITLE["_parse_title()"]
-    EXTRACT --> HEADERS["_parse_section_headers()\n(ÉCHAUFFEMENT, GAMMES, ...)"]
-    EXTRACT --> MAINROW["_parse_main_row()\nNx ==> duration/distance, r = rest"]
-    EXTRACT --> ZONES["_parse_main_set_zones()\n+ _parse_main_set_zone_percents()\n(Z5 / 95-100% overlay, if any)"]
-    EXTRACT --> PACETABLE["_parse_pace_table()\nVMA reference table"]
-
-    HEADERS --> EXPAND["_expand_combined_headers()\nsplit a '+'-joined header\nacross its block's entries"]
-    MAINROW --> EXPAND
-
-    EXPAND --> DISPATCH{{"parse_planiteam_pdf()\nper-block dispatch\n- see diagram 2 -"}}
-    ZONES --> DISPATCH
-    PACETABLE --> DISPATCH
-
-    DISPATCH --> SEGMENTS["list[Segment]\n(each holding list[Step])"]
-    TITLE --> WORKOUT["Workout"]
-    SEGMENTS --> WORKOUT
-
-    WORKOUT --> TEXT["to_intervals_icu_text()\nintervals.icu line syntax"]
-    WORKOUT --> JSONOUT["to_coros_json()\ndebug/alternate output"]
-
-    TEXT --> PUSH["push_event() / push_to_recipients()\nPOST .../events (HTTP Basic, API_KEY)"]
-    PUSH --> ICU["intervals.icu calendar\n(-> synced to COROS watch,\nconfigured on intervals.icu's site)"]
-```
-
-## 2. Per-block target/cue dispatch
-
-This is the core of `parse_planiteam_pdf()`: for every `(name, block)` pair
-(after `+`-header expansion), decide **how to label and target** each entry.
-Matching between an entry and its zone/percent/pace-table data is always
-done by **nearest x-position** (`_nearest_payload` / `_nearest_column_index`,
-tolerance `_X0_MATCH_TOL`), never by a flat count or sequence index - that
-was the main source of silent breakage across PDF layouts (see
-`CLAUDE.md`).
+## Pipeline
 
 ```mermaid
 flowchart TD
-    START(["(name, block) pair"]) --> EMPTY{"block has\nentries?"}
-    EMPTY -- "no (a 'Consigne'\nplaceholder block)" --> SKIP["skip - nothing to render"]
-    EMPTY -- yes --> ROLE{"name contains\nCHAUFFEMENT / CALME?"}
-
-    ROLE -- "warmup / cooldown" --> ROLESTEPS["_build_role_steps()\nno cue (role flag alone\nnames the step on-device);\npace = nearest pace-table\ncolumn to the entry's x0"]
-
-    ROLE -- "no role" --> MAINSET{"is_main_set?\n(>1 entry, OR\n1 entry + attached rest)"}
-
-    MAINSET -- no --> PLAIN["_build_plain_steps()\ncue = _display_name(name)\n(e.g. 'Gammes'); never targeted"]
-
-    MAINSET -- yes --> HASZONE{"any Z#/%VMA\noverlay anywhere\non the page?"}
-
-    HASZONE -- yes --> MATCHZONE{"nearest zone + percent\nfound for EVERY entry\nin this block?"}
-    MATCHZONE -- yes --> ZONESTEPS["_build_zone_steps()\ncue: Effort[ Cotes]/Récupération\nby zone number vs block max;\ntarget: _vma_pace_target(lo,hi,vma)\n(always a range, e.g. 3:26-3:37/km);\na rest's target borrows the block's\nOTHER zone if one exists, else None"]
-    MATCHZONE -- no --> UNTARGETED
-
-    HASZONE -- no --> PERSTEP{"pace table has\n>2 columns?"}
-    PERSTEP -- yes --> PERSTEPSTEPS["_build_per_step_main_set_steps()\ncue alternates Effort/Récupération\nby position (no zone data to\nclassify by); target = nearest\npace-table column to entry's x0\n(rescaled if the column is a raw\nsplit-time, e.g. distance entries)"]
-    PERSTEP -- no --> UNTARGETED["_build_untargeted_main_set_steps()\ncue alternates Effort/Récupération\nby position; no target available"]
-
-    ROLESTEPS --> SEGMENT["Segment(name, repeat, steps, role)"]
-    PLAIN --> SEGMENT
-    ZONESTEPS --> SEGMENT
-    PERSTEPSTEPS --> SEGMENT
-    UNTARGETED --> SEGMENT
+    PDF["Planiteam PDF (single page)"] --> WORDS["pdfplumber extract_words()\nwords + x0/top/bottom"]
+    WORDS --> GRID["_read_page(): locate the grid\n'==>' rest row, then the nearest 'Nx' row above it"]
+    GRID --> TITLE["title: words above the first row's bottom"]
+    GRID --> HEADERS["headers: words between title and grid\n(_parse_section_headers)"]
+    GRID --> BLOCKS["blocks: 'Nx' + entries + nearest 'r = rest'\n(_parse_blocks)"]
+    GRID --> BELOW["below the grid: Z# labels, %VMA bands,\npace-table columns (_parse_pace_columns)"]
+    HEADERS --> PAIR["pair headers with blocks 1:1\n(count mismatch -> ValueError)\nsplit 'A + B' headers"]
+    BLOCKS --> PAIR
+    PAIR --> PLAN["_build_segments(): classify each entry"]
+    BELOW --> PLAN
+    PLAN --> WORKOUT["Workout(title, segments)\ntargets stored as %VMA"]
+    WORKOUT --> TEXT["to_intervals_icu_text(vma)"]
+    TEXT --> PUSH["intervals_icu.push_to_recipients()\none render + POST per recipient VMA"]
 ```
+
+Only relative positions are used: the grid rows are found from their
+content, and everything else is defined as above, between or below them.
+Entries are matched to rests, zone labels, %VMA bands and pace columns by
+**nearest x0** within `_X_TOL` (20pt), never by order or count.
+
+## Entry classification
+
+```mermaid
+flowchart TD
+    E(["block entries"]) --> LAP{"'Lap' entry?"}
+    LAP -- yes --> LAPSEG["own segment: 'Gammes Press lap',\nkeeps the block's role"]
+    LAP -- no --> ROLE{"header has CHAUFFEMENT / CALME?"}
+    ROLE -- yes --> ROLESEG["Warmup / Cooldown segment\nno cue, no target"]
+    ROLE -- no --> MULTI{"> 1 entry, or 1 entry\nwith an attached rest?"}
+    MULTI -- no --> PLAIN["plain step, cue = header name\ntarget only if its %VMA says effort"]
+    MULTI -- yes --> INT["interval steps"]
+    INT --> INTENSITY["intensity = nearest Z# label +\nnearest %VMA band, else nearest pace column's %VMA"]
+    INTENSITY --> KIND{"recovery?\nZ<=2, else %VMA < 70"}
+    KIND -- "unknown" --> ERR["ValueError"]
+    KIND -- recovery --> REC["'Récupération' [Zn on côtes]\nno target"]
+    KIND -- effort --> EFF["'Effort' / 'Effort Cotes Zn'\ntarget = %VMA (none on côtes)"]
+```
+
+An attached `r = rest` always becomes an extra untargeted `Récupération` step.
 
 ## Key data shapes
 
-- **`Step`** - one rendered line (`- [cue] duration-or-distance [target Pace]`).
-  Exactly one of `duration_s` / `distance_m` is set.
-- **`Segment`** - a named block (warm-up, main set, ...): `repeat` count,
-  `role` (`"warmup"`/`"cooldown"`/`None`, drives the device step-type flag),
-  and its `Step`s.
-- **`Workout`** - `title` + ordered `Segment`s; renders to either
-  intervals.icu's line syntax or a debug JSON doc.
-- **entry** (internal, not a public type) - one parsed cell from the
-  duration/distance row: `{x0, duration_s, distance_m, distance_unit,
-  rest_s}`. `rest_s` is the attached "r = ..." gap *after* this entry,
-  matched by nearest x-position rather than by sequence order (see
-  `_parse_rest_groups` / `_consume_nearest_rest` in CLAUDE.md).
+- **`Step`**: `duration_s` or `distance_m`, `cue`, `pace_pct` (`(lo, hi)`
+  %VMA; equal bounds = single pace), `until_lap_press`.
+- **`Segment`**: `name`, `repeat`, `role` (`"warmup"`/`"cooldown"`/`None`), steps.
+- **`Workout`**: `title` + segments; `to_intervals_icu_text(vma)` renders it.
+- **`_PaceColumn`**: one pace-table column; `vma_pct(distance_m)` averages
+  the %VMA implied by every row (split-time cells are rescaled by distance).
 
-## Where to look when a new PDF breaks this
+## When a new PDF breaks
 
-1. Dump `page.extract_words()` sorted by `(top, x0)` for the new PDF and
-   compare its structural landmarks (`==>`, `r =`, `Nx`, `Z\d`, pace-table
-   column x0s) against a working sample - see CLAUDE.md's "Practical notes
-   for extending the parser".
-2. Everything in diagram 2 is decided *per block*, by x-position matching,
-   not by any fixed page coordinate or flat count - if something doesn't
-   line up, the fix is almost always "match this by nearest x0 instead of
-   assuming a fixed position/order", the same pattern used throughout this
-   file.
-3. Add the new PDF + a hand-checked `expected.workout.intervals.txt` under
-   `example/<date>/` and wire it into `tests/test_planiteam_to_coros.py`.
+1. Run it through the CLI; the `ValueError` message names what didn't fit.
+2. Dump `page.extract_words()` sorted by `(top, x0)` and compare landmarks
+   (`==>`, `r =`, `Nx`, `Z\d`, pace cells) with a working sample.
+3. Add the PDF and a hand-checked `expected.workout.intervals.txt` under
+   `example/<date>/`; `tests/test_examples.py` picks it up automatically.

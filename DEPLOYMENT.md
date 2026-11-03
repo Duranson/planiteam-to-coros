@@ -8,8 +8,8 @@ Two pieces, both cloud-hosted (nothing depends on any local machine being on):
   needed - Apps Script gets native Gmail access via its own built-in
   authorization.
 - **Cloud Function** (`main.py`, repo root): receives that POST, runs the
-  existing `parse_planiteam_pdf`/`push_event` unchanged, pushes the event to
-  intervals.icu.
+  existing `parse_planiteam_pdf` once, then pushes the event to each
+  recipient's intervals.icu account (`intervals_icu.push_to_recipients`).
 
 Why split it this way, and why polling instead of Gmail push notifications:
 see the chat history / commit message - short version is that Apps Script's
@@ -38,9 +38,9 @@ REGION=europe-west1          # or your preferred region
 
 ## 1. Build your recipients list
 
-The function pushes the same PDF to every enabled recipient, each parsed
-with their own VMA and pushed with their own intervals.icu credentials (see
-`planiteam_to_coros.Recipient`/`push_to_recipients`). Create a local,
+The function pushes the same parsed session to every enabled recipient, each
+rendered with their own VMA and pushed with their own intervals.icu
+credentials (see `intervals_icu.Recipient`/`push_to_recipients`). Create a local,
 **gitignored** `recipients.json` (already in `.gitignore`/`.gcloudignore` -
 never commit it):
 
@@ -121,7 +121,7 @@ gcloud config set project "$PROJECT_ID"
 gcloud services enable secretmanager.googleapis.com cloudfunctions.googleapis.com cloudbuild.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com
 
 # The whole club's list (name/vma/api_key/athlete_id per member, see
-# planiteam_to_coros.Recipient) as one secret - see step 1 above for the
+# intervals_icu.Recipient) as one secret - see step 1 above for the
 # JSON shape. `manage_recipients.py` creates it here (first run, since it
 # doesn't exist yet) the same way it publishes later updates.
 python manage_recipients.py
@@ -256,7 +256,7 @@ nothing about the running function watches the repo afterwards. Every code
 change from here on needs a fresh `gcloud functions deploy`, or it silently
 keeps running the old version. `.github/workflows/deploy.yml` automates
 that: on every push to `main` that touches `main.py`, `planiteam_to_coros.py`,
-`requirements.txt` or `.gcloudignore`, it runs the test suite and then the
+`intervals_icu.py`, `requirements.txt` or `.gcloudignore`, it runs the test suite and then the
 exact same deploy command from step 4.
 
 Authentication uses **Workload Identity Federation**: GitHub's own per-run
@@ -337,9 +337,9 @@ RECIPIENTS_JSON` (step 1) - no code push required for those.
 
 ## Failure behaviour
 
-Each recipient is parsed and pushed independently (`push_to_recipients` in
-`planiteam_to_coros.py`) - one recipient's failure (a revoked key, a VMA
-that pushes some edge case in their parse) doesn't block anyone else's, and
+The PDF is parsed once; each recipient is then pushed independently
+(`push_to_recipients` in `intervals_icu.py`) - one recipient's failure (a
+revoked key, a network error) doesn't block anyone else's, and
 is only visible in the Cloud Function's own logs (GCP Console -> Cloud Run
 -> the function -> Logs), one line per recipient by name: `Pushed to X:
 event id ...` or `FAILED to push to X: ...`. There's currently no

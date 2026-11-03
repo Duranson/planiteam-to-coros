@@ -8,14 +8,15 @@ DEPLOYMENT.md:
       -> Apps Script (time-driven trigger, extracts PDF + date, no PDF
          parsing - just Gmail access and an HTTPS POST)
       -> this Cloud Function (does the actual PDF parsing via
-         planiteam_to_coros.parse_planiteam_pdf, then push_event, once per
-         recipient in RECIPIENTS_JSON)
+         planiteam_to_coros.parse_planiteam_pdf, once), then pushes it with
+         intervals_icu.push_to_recipients, once per recipient in
+         RECIPIENTS_JSON, each with their own VMA)
 
 Credentials (RECIPIENTS_JSON, SHARED_SECRET) are bound as plain environment
 variables at deploy time via `gcloud functions deploy --set-secrets=...`
 (Secret Manager) - never read from a .env file or baked into the deployed
 source. RECIPIENTS_JSON holds the whole club's list (name/vma/api_key/
-athlete_id per member, see planiteam_to_coros.Recipient) as a single secret,
+athlete_id per member, see intervals_icu.Recipient) as a single secret,
 so adding or removing someone only changes that secret's value, not the
 deploy command.
 """
@@ -31,9 +32,8 @@ from pathlib import Path
 import functions_framework
 from flask import Request, jsonify
 
-from planiteam_to_coros import parse_recipients, push_to_recipients
-
-DEFAULT_SPORT = "Run"
+from intervals_icu import parse_recipients, push_to_recipients
+from planiteam_to_coros import parse_planiteam_pdf
 
 
 @functions_framework.http
@@ -62,14 +62,12 @@ def handle_planiteam_email(request: Request):
         pdf_path.write_bytes(base64.b64decode(pdf_b64))
 
         try:
-            results = push_to_recipients(
-                pdf_path,
-                date=date,
-                recipients=recipients,
-                sport=payload.get("sport", DEFAULT_SPORT),
-            )
-        except Exception as exc:  # boundary: failure outside the per-recipient loop (e.g. bad temp file)
+            workout = parse_planiteam_pdf(pdf_path)
+        except Exception as exc:  # boundary: unparseable PDF -> 502 so Apps Script labels the email for retry
+            print(f"FAILED to parse workout: {exc}")
             return jsonify({"error": f"failed to process workout: {exc}"}), 502
+
+    results = push_to_recipients(workout, date=date, recipients=recipients)
 
     # Logged per recipient (by name, per their request) so a broken account
     # is identifiable from the Cloud Function's logs without blocking
@@ -80,10 +78,9 @@ def handle_planiteam_email(request: Request):
         else:
             print(f"FAILED to push to {result.name}: {result.error}")
 
-    title = next((r.title for r in results if r.title), None)
     response_body = {
         "status": "ok" if any(r.ok for r in results) else "error",
-        "title": title,
+        "title": workout.title,
         "results": [dataclasses.asdict(r) for r in results],
     }
     # A total failure (nobody got pushed) is treated as a failed request so
