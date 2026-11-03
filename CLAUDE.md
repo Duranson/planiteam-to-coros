@@ -893,3 +893,57 @@ back to the athlete instead (per this file's standing "a human-provided
 expected file is a hypothesis to check against the source data, not
 automatically ground truth" rule, established earlier in this file and
 re-confirmed repeatedly this round).
+
+## Targets dropped on purpose: warm-up, cool-down and côtes (Nov 2026)
+
+Athlete's product decisions after using the synced sessions on the watch:
+
+- **Warm-up/cool-down get no pace target**, even though the pace table still
+  prints one (the 60%/55% columns documented above are no longer consumed for
+  role blocks - `_build_role_steps`). The on-watch pace alerts were more
+  distracting than useful during those phases.
+- **Côtes blocks get no pace target at all** (efforts and recoveries), only a
+  cue. Asked first whether COROS's grade-adjusted "Allure d'effort" target
+  could be used instead: it can't. intervals.icu's API only knows `GAP` for
+  analysis (curves/zone times; workout targets are `POWER/HR/PACE`), and the
+  FIT `workout_step` target-type enum has no grade-adjusted variant - any
+  pace target reaches the watch as plain `speed`. COROS effort pace is only
+  settable in COROS's own app. Since the pace no longer shows, the PDF's zone
+  label is appended to the cue instead (`Effort Cotes Z5`,
+  `Récupération Z1`); a rest with no zone token of its own stays a bare
+  `Récupération`.
+- **Recovery steps get no pace target either**, in every block type
+  (low-zone entries, trailing rests, odd entries of a per-step-pace block).
+  This makes the 40% `_OPEN_LOWER_BOUND_FLOOR_PCT` floor described above
+  effectively unused today (it only ever applied to `0-65%` Z1 recoveries);
+  it's kept in `_vma_pace_target` in case a low-bound-0 band ever targets an
+  effort.
+- **Effort vs recovery is now by absolute zone number** (`_MAX_RECOVERY_ZONE
+  = 2`: Z1/Z2 recovery, Z3+ effort) instead of "highest zone in the block is
+  the effort". The 2026-11-02 PDF mixes Z4 and Z5 efforts in one block, and
+  the old rule labelled its Z4 efforts "Récupération" - the failure mode the
+  zone-cue section above predicted for blocks with more than two zones.
+
+## "Lap" entries: open-ended drills ended by the lap button
+
+The 2026-11-02 PDF prints `Lap` instead of a duration as the second entry of
+its ÉCHAUFFEMENT block (pace table shows `-` under it). Verified live (probe
+pushed, `GET` + `download.fit` inspected, deleted): any step line containing
+`Press lap` gets `"until_lap_press": true` in `workout_doc` and exports to FIT
+as `duration_type: 'open'`, `target_type: 'open'` - no time limit, no target,
+ends on a lap press. Works under a `Warmup` header too (`intensity: 'warmup'`
+in the FIT). Caveats seen in that probe:
+
+- A duration is still required in the text; it only feeds intervals.icu's
+  planned total (`moving_time`), not the device. `_LAP_DEFAULT_DURATION_S`
+  (10 min) is the athlete's choice, not from the PDF.
+- intervals.icu keeps "Press lap" inside the step name (`wkt_step_name:
+  'Gammes Press lap'`), so the watch most likely shows it as part of the
+  block name.
+- Not yet confirmed how COROS presents an open-duration step on-device.
+
+Each `Lap` entry is split out into its own segment (`_split_lap_entries`),
+keeping the enclosing block's role, cue `_LAP_CUE = "Gammes"` (athlete's
+choice - the PDF header above it is just ÉCHAUFFEMENT). It must be a separate
+segment: one `Warmup` header over a two-step block would render as a `1x`
+repeat group.

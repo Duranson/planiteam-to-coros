@@ -1,5 +1,5 @@
 Warmup
-- 20m 5:43/km Pace
+- 20m
 
 - Gammes 10m
 
@@ -14,4 +14,4 @@ Warmup
 - Récupération 1m
 
 Cooldown
-- 10m 6:14/km Pace
+- 10m

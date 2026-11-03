@@ -86,6 +86,19 @@ _HEADER_JOIN_FIXUPS = {
 # first sample PDF".
 _X0_MATCH_TOL = 20.0
 
+# A "Lap" token on the duration row is a free-length block ended by the
+# athlete's lap-button press (used for drills - see CLAUDE.md). The PDF gives
+# it no duration, so these are product choices, not extracted values: the
+# duration only feeds intervals.icu's planned total, never the device.
+_LAP_TOKEN = "lap"
+_LAP_DEFAULT_DURATION_S = 10 * 60
+_LAP_CUE = "Gammes"
+
+# Zones at or below this number are recovery ("Récupération"), above it are
+# efforts. Every PDF seen so far uses Z1 (0-65%) for recovery and Z4/Z5 for
+# efforts, sometimes mixing Z4 and Z5 efforts in one block.
+_MAX_RECOVERY_ZONE = 2
+
 
 @dataclass
 class Step:
@@ -100,6 +113,12 @@ class Step:
     as a step-level text label (not a structured type, unlike
     ``Segment.role``'s warmup/cooldown flags - see CLAUDE.md), and that it
     shows up as that step's block name on the COROS device.
+
+    ``until_lap_press`` renders a "Press lap" keyword on the line. Confirmed
+    live that intervals.icu then flags the step ``until_lap_press`` and
+    exports it to FIT as ``duration_type: 'open'`` - the step only ends on a
+    lap-button press. The duration is still required in the text (it only
+    feeds intervals.icu's planned total, it isn't sent to the device).
     """
 
     duration_s: Optional[int] = None
@@ -107,6 +126,7 @@ class Step:
     distance_unit: str = "m"
     target: Optional[str] = None
     cue: Optional[str] = None
+    until_lap_press: bool = False
 
     def render(self) -> str:
         if self.distance_m is not None:
@@ -117,6 +137,8 @@ class Step:
         # "Pace" suffix for running targets (zone or absolute pace) - a bare
         # "Z5" defaults to a *power* zone, and a bare pace value is ignored.
         parts = [self.cue] if self.cue else []
+        if self.until_lap_press:
+            parts.append("Press lap")
         parts.append(token)
         if self.target:
             parts.append(f"{self.target} Pace")
@@ -169,6 +191,7 @@ class Workout:
                             "distance_m": step.distance_m,
                             "target": step.target,
                             "cue": step.cue,
+                            "until_lap_press": step.until_lap_press,
                         }
                         for step in segment.steps
                     ],
@@ -477,8 +500,10 @@ def _parse_main_row(words: Sequence[dict]) -> List[dict]:
     Each block is ``{"repeat": int, "entries": [entry, ...]}`` where an
     entry is ``{"x0": float, "duration_s": Optional[int],
     "distance_m": Optional[float], "distance_unit": Optional[str],
-    "rest_s": Optional[int]}`` - exactly one of ``duration_s``/``distance_m``
-    is set, depending on whether this entry is a time or a distance.
+    "rest_s": Optional[int], "lap": bool}`` - exactly one of
+    ``duration_s``/``distance_m`` is set, depending on whether this entry is a
+    time or a distance. A "Lap" token is a ``lap`` entry with the default
+    placeholder duration ``_LAP_DEFAULT_DURATION_S``.
 
     The two rows involved (durations, then "r = rest" below them) are found
     *relative to each other* - the "==>" row, then the nearest row above it
@@ -523,7 +548,11 @@ def _parse_main_row(words: Sequence[dict]) -> List[dict]:
         duration_s: Optional[int] = None
         distance_m: Optional[float] = None
         distance_unit: Optional[str] = None
-        if _DURATION_RE.match(text):
+        lap = False
+        if text.lower() == _LAP_TOKEN:
+            duration_s = _LAP_DEFAULT_DURATION_S
+            lap = True
+        elif _DURATION_RE.match(text):
             duration_s = _parse_mmss(text)
         elif _DISTANCE_KM_RE.match(text):
             distance_m = float(_DISTANCE_KM_RE.match(text).group(1)) * 1000
@@ -546,6 +575,7 @@ def _parse_main_row(words: Sequence[dict]) -> List[dict]:
                 "distance_m": distance_m,
                 "distance_unit": distance_unit,
                 "rest_s": rest_s,
+                "lap": lap,
             }
         )
     return blocks
@@ -695,16 +725,18 @@ def _zone_number(zone: str) -> int:
     return int(match.group()) if match else 0
 
 
-def _zone_cue(zone: str, max_zone: int, is_cotes: bool) -> str:
+def _zone_cue(zone: str, is_cotes: bool) -> str:
     # Generic effort/recovery cue, not tied to any one workout's content -
-    # the highest zone number used in the block is "Effort", anything lower
-    # is "Récupération". Confirmed live that this text becomes the step's
-    # block name on the COROS device (see Step.cue docstring). "Cotes" is
-    # appended to an effort cue when the block's own section name mentions
-    # hill repeats ("côtes"), per the athlete's own labelling convention.
-    if _zone_number(zone) >= max_zone:
-        return "Effort Cotes" if is_cotes else "Effort"
-    return "Récupération"
+    # a low zone (<= _MAX_RECOVERY_ZONE) is "Récupération", anything above is
+    # "Effort" (an earlier "highest zone in the block is the effort" rule
+    # mislabelled the Z4 efforts of a mixed Z4/Z5 block as recoveries).
+    # Confirmed live that this text becomes the step's block name on the
+    # COROS device (see Step.cue docstring). "Cotes" is appended to an effort
+    # cue when the block's own section name mentions hill repeats ("côtes"),
+    # per the athlete's own labelling convention. Côtes blocks also carry the
+    # PDF's zone label in the cue, since they get no pace target to show it.
+    cue = "Récupération" if _zone_number(zone) <= _MAX_RECOVERY_ZONE else "Effort Cotes" if is_cotes else "Effort"
+    return f"{cue} {zone}" if is_cotes else cue
 
 
 def _make_step(entry: dict, target: Optional[str], cue: Optional[str]) -> Step:
@@ -713,25 +745,15 @@ def _make_step(entry: dict, target: Optional[str], cue: Optional[str]) -> Step:
     return Step(duration_s=entry["duration_s"], target=target, cue=cue)
 
 
-def _build_role_steps(
-    entries: Sequence[dict],
-    column_x0s: Sequence[float],
-    pace_table: Dict[float, List[Tuple[float, int, str]]],
-    vma: float,
-) -> List[Step]:
+def _build_role_steps(entries: Sequence[dict]) -> List[Step]:
     """Warm-up/cool-down steps: no cue (the role flag alone names the block
-    correctly on-device, see Segment.role), pace from the nearest pace-table
-    column to this entry's own x-position."""
+    correctly on-device, see Segment.role) and no pace target - the athlete
+    found a pace alert during warm-up/cool-down more distracting than useful,
+    even though the PDF's pace table does print one (see CLAUDE.md)."""
 
     steps: List[Step] = []
     for entry in entries:
-        target = None
-        if pace_table:
-            col = _nearest_column_index(entry["x0"], column_x0s)
-            if col is not None:
-                seconds, kind = _lookup_pace(pace_table, vma, col)
-                target = _pace_cell_to_target(seconds, kind, entry["distance_m"])
-        steps.append(_make_step(entry, target=target, cue=None))
+        steps.append(_make_step(entry, target=None, cue=None))
         if entry["rest_s"]:
             steps.append(Step(duration_s=entry["rest_s"], target=None, cue=None))
     return steps
@@ -742,32 +764,24 @@ def _build_zone_steps(entries: Sequence[dict], matched: Sequence[Tuple[str, Tupl
     parse_planiteam_pdf). Each entry has already been matched to its own
     nearest zone+percent band by x-position.
 
-    A trailing rest attached to an entry (e.g. the long recovery before an
-    outer repeat, or the jog between distance reps) is targeted using
-    whichever *other* zone is used elsewhere in this same block, if any -
-    this is what the block alternates between. When the block only ever uses
-    one zone (no second zone/percent token nearby for any entry - common on
-    the single-effort-distance blocks), there is nothing to borrow from and
-    the rest is left untargeted rather than reusing the effort's own pace
-    (which would be wrong - see CLAUDE.md).
-    """
+    Recovery steps - low-zone entries and any trailing rest attached to an
+    entry (e.g. the long recovery before an outer repeat) - get no pace
+    target: the athlete wants recoveries free of pace alerts (see CLAUDE.md).
 
-    zone_numbers = [_zone_number(zone) for zone, _ in matched]
-    max_zone = max(zone_numbers)
-    distinct: List[Tuple[str, Tuple[int, int]]] = []
-    for zone, pct in matched:
-        if not any(zone == dzone for dzone, _ in distinct):
-            distinct.append((zone, pct))
+    A côtes block gets no pace target at all (a flat-ground pace is
+    meaningless on a slope, and COROS's own grade-adjusted "effort pace"
+    target can't be set through intervals.icu/FIT - see CLAUDE.md); the zone
+    label goes into the cue instead (see ``_zone_cue``).
+    """
 
     steps: List[Step] = []
     for entry, (zone, pct) in zip(entries, matched):
-        cue = _zone_cue(zone, max_zone, is_cotes)
-        target = _vma_pace_target(pct[0], pct[1], vma)
+        cue = _zone_cue(zone, is_cotes)
+        is_recovery = _zone_number(zone) <= _MAX_RECOVERY_ZONE
+        target = None if is_cotes or is_recovery else _vma_pace_target(pct[0], pct[1], vma)
         steps.append(_make_step(entry, target=target, cue=cue))
         if entry["rest_s"]:
-            alt = next((dzone_pct for dzone_pct in distinct if dzone_pct[0] != zone), None)
-            rest_target = _vma_pace_target(alt[1][0], alt[1][1], vma) if alt is not None else None
-            steps.append(Step(duration_s=entry["rest_s"], target=rest_target, cue="Récupération"))
+            steps.append(Step(duration_s=entry["rest_s"], target=None, cue="Récupération"))
     return steps
 
 
@@ -781,13 +795,16 @@ def _build_per_step_main_set_steps(
     """Main-set steps targeted via a per-entry pace-table column (no zone
     data on this PDF at all - see ``parse_planiteam_pdf``). Effort/recovery
     is inferred purely by position (every workout seen so far starts with an
-    effort and alternates), since there's no zone data to classify by."""
+    effort and alternates), since there's no zone data to classify by. A
+    côtes block and recovery steps stay untargeted, same as in
+    ``_build_zone_steps``."""
 
     steps: List[Step] = []
     for i, entry in enumerate(entries):
-        cue = ("Effort Cotes" if is_cotes else "Effort") if i % 2 == 0 else "Récupération"
+        is_recovery = i % 2 == 1
+        cue = "Récupération" if is_recovery else "Effort Cotes" if is_cotes else "Effort"
         target = None
-        col = _nearest_column_index(entry["x0"], column_x0s)
+        col = None if is_cotes or is_recovery else _nearest_column_index(entry["x0"], column_x0s)
         if col is not None:
             seconds, kind = _lookup_pace(pace_table, vma, col)
             target = _pace_cell_to_target(seconds, kind, entry["distance_m"])
@@ -852,6 +869,29 @@ def _build_plain_steps(
     return steps
 
 
+def _split_lap_entries(pairs: Sequence[Tuple[str, dict]]) -> List[Tuple[str, dict]]:
+    """Split every "Lap" entry out of its block into a block of its own, in
+    page order (e.g. ÉCHAUFFEMENT's ``20:00, Lap`` becomes ``20:00`` then
+    ``Lap``). It renders as a separate segment so it can carry its own
+    warmup header line - one "Warmup" header over a two-step block would
+    otherwise turn into a "1x" repeat group (see ``to_intervals_icu_text``)."""
+
+    result: List[Tuple[str, dict]] = []
+    for name, block in pairs:
+        run: List[dict] = []
+        for entry in block["entries"]:
+            if entry["lap"]:
+                if run:
+                    result.append((name, {**block, "entries": run}))
+                    run = []
+                result.append((name, {**block, "repeat": 1, "entries": [entry]}))
+            else:
+                run.append(entry)
+        if run or not block["entries"]:
+            result.append((name, {**block, "entries": run}))
+    return result
+
+
 def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Workout:
     """Parse a Planiteam PDF export into a Workout, using ``vma`` (km/h) to
     resolve step paces from the PDF's reference table.
@@ -893,8 +933,18 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
     use_per_step = not page_has_zone_data and len(column_x0s) > 2
 
     segments: List[Segment] = []
-    for name, block in name_block_pairs:
+    for name, block in _split_lap_entries(name_block_pairs):
         entries = block["entries"]
+        name_compact = name.upper().replace(" ", "")
+        role = "warmup" if "CHAUFFEMENT" in name_compact else "cooldown" if "CALME" in name_compact else None
+
+        if entries and entries[0]["lap"]:
+            # A "Lap" drills block (see _split_lap_entries): open-ended, no
+            # target, keeps the enclosing block's warmup/cooldown role.
+            steps = [Step(duration_s=entries[0]["duration_s"], cue=_LAP_CUE, until_lap_press=True)]
+            segments.append(Segment(name=_LAP_CUE, repeat=1, steps=steps, role=role))
+            continue
+
         if not entries:
             # A placeholder block - Planiteam sometimes prints a free-text
             # "Consigne" note instead of a measurable duration/distance here
@@ -902,13 +952,11 @@ def parse_planiteam_pdf(path: Union[str, Path], vma: float = DEFAULT_VMA) -> Wor
             # fixed duration of its own) - nothing to render. See CLAUDE.md.
             continue
 
-        name_compact = name.upper().replace(" ", "")
-        role = "warmup" if "CHAUFFEMENT" in name_compact else "cooldown" if "CALME" in name_compact else None
         is_cotes = _mentions_cotes(name)
         is_main_set = role is None and (len(entries) > 1 or bool(entries[0]["rest_s"]))
 
         if role is not None:
-            steps = _build_role_steps(entries, column_x0s, pace_table, vma)
+            steps = _build_role_steps(entries)
         elif is_main_set and page_has_zone_data:
             matched = [(_nearest_payload(e["x0"], zones), _nearest_payload(e["x0"], percents)) for e in entries]
             if all(zone is not None and pct is not None for zone, pct in matched):
