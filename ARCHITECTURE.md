@@ -41,7 +41,7 @@ Entries are matched to rests, zone labels, %VMA bands and pace columns by
 ```mermaid
 flowchart TD
     E(["block entries"]) --> LAP{"'Lap' entry?"}
-    LAP -- yes --> LAPSEG["own segment: 'Gammes Press lap',\nkeeps the block's role"]
+    LAP -- yes --> LAPSEG["own segment: 'Gammes 10m Press lap',\nkeeps the block's role"]
     LAP -- no --> ROLE{"header has CHAUFFEMENT / CALME?"}
     ROLE -- yes --> ROLESEG["Warmup / Cooldown segment\nno cue, no target"]
     ROLE -- no --> MULTI{"> 1 entry, or 1 entry\nwith an attached rest?"}
@@ -51,7 +51,7 @@ flowchart TD
     INTENSITY --> KIND{"recovery?\nZ<=2, else %VMA < 70"}
     KIND -- "unknown" --> ERR["ValueError"]
     KIND -- recovery --> REC["'Récupération' [(Zn) on côtes]\nno target"]
-    KIND -- effort --> EFF["'Effort' / 'Effort Côtes (Zn)'\ntarget = %VMA (none on côtes)"]
+    KIND -- effort --> EFF["'Effort' / 'Côtes (Zn)'\ntarget = %VMA (none on côtes)"]
 ```
 
 An attached `r = rest` always becomes an extra untargeted `Récupération` step.

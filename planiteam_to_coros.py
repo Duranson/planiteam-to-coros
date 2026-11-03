@@ -98,9 +98,9 @@ class Step:
 
     def render(self, vma: float) -> str:
         parts = [self.cue] if self.cue else []
+        parts.append(_format_distance(self.distance_m) if self.distance_m is not None else _format_duration(self.duration_s or 0))
         if self.until_lap_press:
             parts.append("Press lap")
-        parts.append(_format_distance(self.distance_m) if self.distance_m is not None else _format_duration(self.duration_s or 0))
         if self.pace_pct:
             # A bare pace is silently dropped by intervals.icu: "Pace" is required.
             parts.append(f"{_format_pace_target(self.pace_pct, vma)} Pace")
@@ -481,7 +481,7 @@ def _interval_steps(block: _Block, entries: Sequence[_Entry], page: _Page) -> Li
         recovery = _is_recovery(zone, band)
         if recovery is None:
             raise ValueError(f"{block.name}: no zone label or pace column next to the step at x={entry.x0:.0f}")
-        cue = RECOVERY_CUE if recovery else "Effort Côtes" if is_cotes else "Effort"
+        cue = RECOVERY_CUE if recovery else "Côtes" if is_cotes else "Effort"
         if is_cotes and zone is not None:
             # Parenthesised: a bare "Z4" on the line is read by intervals.icu
             # as a *power* zone target, which shows as "(0-0w)" and crashes COROS.

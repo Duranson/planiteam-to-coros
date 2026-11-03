@@ -102,7 +102,7 @@ exactly-100% target computed as 3:26) - the computed value is used.
   grade-adjusted "Allure d'effort" can't be set via intervals.icu/FIT (the
   FIT target-type enum has no grade-adjusted variant; intervals.icu's `GAP`
   is analysis-only). The zone goes in the cue instead, **in parentheses**:
-  `Effort Côtes (Z5)`, `Récupération (Z1)`; a rest with no zone label of its
+  `Côtes (Z5)`, `Récupération (Z1)`; a rest with no zone label of its
   own is a bare `Récupération`. A bare `Z5` anywhere on a step line is read
   as a power-zone target (rendered `(0-0w)` without FTP, which crashed the
   COROS app).
@@ -149,14 +149,17 @@ fetch `<url>.json`, the HTML is an empty app shell). All verified live:
   line are dropped, inside or outside repeats. As a leading word on a step
   line it becomes the step's `"text"`.
 - **Cue text** (leading words on a step line) becomes the step's `"text"`,
-  shown by COROS as the block name - confirmed on the device.
+  shown by COROS as the block name - confirmed on the device. **The COROS
+  app only shows about two words** of it, so keep cues to two words
+  (`Côtes (Z4)`, not `Effort Côtes (Z4)`).
 - **Durations**: `20s`, `10m`, `1m15s`. **Distances**: `500mtr` (a bare `m`
   means *minutes*; `mt` is invalid), `1km` / `1.0km`.
 - **`Press lap`** on a step line -> `"until_lap_press": true`, exported to
   FIT as `duration_type: 'open'`, `target_type: 'open'`; the duration is
-  still required but only feeds `moving_time`. intervals.icu keeps "Press
-  lap" in the step name (`Gammes Press lap`). Not yet confirmed how COROS
-  displays an open step.
+  still required but only feeds `moving_time`. Placed **after the
+  duration** (`- Gammes 10m Press lap`) it stays out of the step name
+  (`"text": "Gammes"`); placed before it, intervals.icu kept it in the name
+  (`Gammes Press lap`).
 - **No idempotent upsert**: client-supplied `uid` is ignored (the server
   assigns its own), so every push creates a new event and re-pushing
   duplicates it. Real idempotency would need the returned event id cached

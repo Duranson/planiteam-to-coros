@@ -60,7 +60,7 @@ class ParsingTest(unittest.TestCase):
         # The trailing 3:00 rest has no zone label of its own.
         self.assertEqual(
             [s.cue for s in main_set.steps],
-            ["Effort Côtes (Z5)", "Récupération (Z1)"] * 5 + ["Effort Côtes (Z5)", "Récupération"],
+            ["Côtes (Z5)", "Récupération (Z1)"] * 5 + ["Côtes (Z5)", "Récupération"],
         )
         self.assertTrue(all(s.pace_pct is None for s in main_set.steps))
 
@@ -109,7 +109,7 @@ class RenderingTest(unittest.TestCase):
         )
         self.assertEqual(
             workout.to_intervals_icu_text(17.5),
-            "Warmup\n- Gammes Press lap 10m\n\n1x\n- 1km\n- 300mtr\n- 1m15s",
+            "Warmup\n- Gammes 10m Press lap\n\n1x\n- 1km\n- 300mtr\n- 1m15s",
         )
 
     def test_open_ended_band_cannot_render_as_a_range(self):
