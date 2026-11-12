@@ -223,10 +223,17 @@ class _PaceColumn:
 
     Every column is a constant %VMA across rows. A "7'42/km" cell is a pace;
     a "05:41" cell is the time to cover the entry's own distance (a split).
+    A "-" cell means no target for that phase: an all-dash column marks a
+    recovery (``no_target``).
     """
 
     x0: float
     cells: List[Tuple[float, int, bool]] = field(default_factory=list)
+    dashes: int = 0
+
+    @property
+    def no_target(self) -> bool:
+        return self.dashes > 0 and not self.cells
 
     def vma_pct(self, distance_m: Optional[int]) -> Optional[int]:
         pcts = []
@@ -370,11 +377,17 @@ def _parse_pace_columns(table_words: Sequence[dict]) -> List[_PaceColumn]:
             elif _DURATION_RE.match(word["text"]):
                 cells.append((word["x0"], float(label["text"]), _parse_mmss(word["text"]), True))
 
+            elif word["text"] == "-":
+                cells.append((word["x0"], float(label["text"]), None, False))
+
     columns: List[_PaceColumn] = []
-    for x0, *cell in sorted(cells):
+    for x0, vma_row, seconds, is_split in sorted(cells, key=lambda c: c[0]):
         if not columns or x0 - columns[-1].x0 > _X_TOL:
             columns.append(_PaceColumn(x0))
-        columns[-1].cells.append(tuple(cell))
+        if seconds is None:
+            columns[-1].dashes += 1
+        else:
+            columns[-1].cells.append((vma_row, seconds, is_split))
     return columns
 
 
@@ -445,24 +458,29 @@ def _read_page(path: Union[str, Path]) -> _Page:
 # --- Plan -------------------------------------------------------------------
 
 
-def _intensity(entry: _Entry, page: _Page) -> Tuple[Optional[int], Optional[PctBand]]:
-    """The entry's zone label and %VMA band: from the Z/% overlay above the
-    table when there is one, else from the pace-table column under it."""
+def _intensity(entry: _Entry, page: _Page) -> Tuple[Optional[int], Optional[PctBand], bool]:
+    """The entry's zone label, %VMA band and whether its pace-table column is
+    an explicit "-" (no target): from the Z/% overlay above the table when
+    there is one, else from the pace-table column under it."""
 
     zone = _nearest(entry.x0, page.zones)
     band = _nearest(entry.x0, page.bands)
+    no_target = False
     if band is None:
         column = _nearest(entry.x0, [(c.x0, c) for c in page.columns])
         pct = column.vma_pct(entry.distance_m) if column else None
         band = (pct, pct) if pct is not None else None
-    return zone, band
+        no_target = column is not None and column.no_target
+    return zone, band, no_target
 
 
-def _is_recovery(zone: Optional[int], band: Optional[PctBand]) -> Optional[bool]:
+def _is_recovery(zone: Optional[int], band: Optional[PctBand], no_target: bool) -> Optional[bool]:
     if zone is not None:
         return zone <= _MAX_RECOVERY_ZONE
     if band is not None:
         return band[1] < _MIN_EFFORT_PCT
+    if no_target:
+        return True
     return None
 
 
@@ -477,8 +495,8 @@ def _interval_steps(block: _Block, entries: Sequence[_Entry], page: _Page) -> Li
     is_cotes = _mentions_cotes(block.name)
     steps: List[Step] = []
     for entry in entries:
-        zone, band = _intensity(entry, page)
-        recovery = _is_recovery(zone, band)
+        zone, band, no_target = _intensity(entry, page)
+        recovery = _is_recovery(zone, band, no_target)
         if recovery is None:
             raise ValueError(f"{block.name}: no zone label or pace column next to the step at x={entry.x0:.0f}")
         cue = RECOVERY_CUE if recovery else "Côtes" if is_cotes else "Effort"
@@ -496,8 +514,8 @@ def _plain_step(block: _Block, entry: _Entry, page: _Page) -> Step:
     """A single-entry block (drills, an inter-block jog, a tempo): named after
     its header, targeted only when its own %VMA marks it as an effort."""
 
-    zone, band = _intensity(entry, page)
-    is_effort = _is_recovery(zone, band) is False and not _mentions_cotes(block.name)
+    zone, band, no_target = _intensity(entry, page)
+    is_effort = _is_recovery(zone, band, no_target) is False and not _mentions_cotes(block.name)
     return _step(entry, cue=_display_name(block.name), pace_pct=band if is_effort else None)
 
 

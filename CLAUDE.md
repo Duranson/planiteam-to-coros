@@ -76,7 +76,9 @@ pace is computed directly from their VMA. Cell kinds:
 - `05:41` - a **split time for the entry's own distance** (e.g. 300m), to be
   rescaled by that distance. For a 1000m entry it equals the pace, which
   made this easy to miss.
-- `-` - no target for that phase.
+- `-` - no target for that phase. Under an interval-block entry this marks
+  a recovery (`2026-11-12`: the recoveries between efforts have a `-`
+  column and no zone overlay; dropping `-` cells used to raise `ValueError`).
 
 Two-column tables (warm-up, cool-down) appear on PDFs with a zone overlay;
 others have a column per phase. The column-derived pace can differ by 1s
@@ -90,7 +92,7 @@ exactly-100% target computed as 3:26) - the computed value is used.
   (pace alerts during those phases were more distracting than useful).
 - **Effort vs recovery**: `Z1`/`Z2` recovery, `Z3+` effort
   (`_MAX_RECOVERY_ZONE`; one PDF mixes Z4 and Z5 efforts). Without a zone,
-  %VMA below 70 is a recovery. No intensity source for a step in an
+  %VMA below 70 or a `-` pace column is a recovery. No intensity source for a step in an
   interval block -> `ValueError`.
 - **Recoveries never get a pace target** (the athlete wants them free of
   alerts). Every attached `r = rest` is an untargeted `Récupération` step.

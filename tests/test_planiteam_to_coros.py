@@ -55,6 +55,13 @@ class ParsingTest(unittest.TestCase):
         steps = p._build_segments(_page([block], columns=columns))[0].steps
         self.assertEqual([(s.cue, s.pace_pct) for s in steps], [("Récupération", None), ("Effort", (90, 90))])
 
+    def test_dash_column_marks_a_recovery(self):
+        # 2026-11-12: recoveries between efforts have a "-" pace column and no zone label.
+        columns = [p._PaceColumn(100, [(20.0, 200, False)]), p._PaceColumn(200, dashes=12)]
+        block = p._Block("SÉRIE", 1, [p._Entry(100, duration_s=120), p._Entry(200, duration_s=70)])
+        steps = p._build_segments(_page([block], columns=columns))[0].steps
+        self.assertEqual([(s.cue, s.pace_pct) for s in steps], [("Effort", (90, 90)), ("Récupération", None)])
+
     def test_cotes_get_zone_in_cue_and_no_pace(self):
         main_set = parse_planiteam_pdf(HILL_SPRINTS_PDF).segments[2]
         # The trailing 3:00 rest has no zone label of its own.
